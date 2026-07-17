@@ -1,7 +1,9 @@
 #include "newpipe/youtube_resolver.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -10,6 +12,7 @@
 #include "nlohmann/json.hpp"
 #include "newpipe/log.hpp"
 #include "newpipe/settings_store.hpp"
+#include "newpipe/ump.hpp"
 
 namespace newpipe {
 namespace {
@@ -19,11 +22,15 @@ using nlohmann::json;
 constexpr const char* kPlayerApiUrl = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
 constexpr const char* kAndroidUserAgent =
     "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip";
+#ifdef __SWITCH__
+constexpr const char* kAndroidVrUserAgent =
+    "com.google.android.apps.youtube.vr.oculus/1.65.10 "
+    "(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+#endif
 constexpr const char* kIosUserAgent =
     "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3 like Mac OS X)";
 constexpr const char* kWebUserAgent =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-constexpr const char* kWebClientVersion = "2.20250401.01.00";
 constexpr const char* kYoutubeOriginHeader = "Origin: https://www.youtube.com";
 
 std::string to_lower(std::string value) {
@@ -294,7 +301,6 @@ std::optional<json> fetch_player_response(
         {"racyCheckOk", true},
         {"context", {{"client", client_payload}}},
     };
-
     const auto response_body = client->post(kPlayerApiUrl, payload.dump(), headers);
     if (!response_body.has_value() || response_body->empty()) {
         error_message = "YouTube player API request failed";
@@ -318,6 +324,94 @@ std::optional<json> fetch_player_response(
 
     return root;
 }
+
+#ifdef __SWITCH__
+std::string generate_web_visitor_id() {
+    constexpr char kVisitorAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    static std::atomic<uint64_t> sequence{0};
+    uint64_t state = static_cast<uint64_t>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count())
+        ^ (++sequence * 0x9e3779b97f4a7c15ULL);
+
+    std::string result(11, 'A');
+    for (char& ch : result) {
+        state ^= state << 13U;
+        state ^= state >> 7U;
+        state ^= state << 17U;
+        ch = kVisitorAlphabet[state & 0x3fU];
+    }
+    return result;
+}
+
+std::string fetch_web_visitor_data(HttpClient* client, std::string& error_message) {
+    const auto response = client->get(
+        "https://www.youtube.com/sw.js_data",
+        {
+            {"Accept-Language", "en-US"},
+            {"Accept", "*/*"},
+            {"User-Agent", kWebUserAgent},
+            {"Referer", "https://www.youtube.com/sw.js"},
+            {"Cookie", "PREF=tz=Asia.Seoul;VISITOR_INFO1_LIVE=" + generate_web_visitor_id() + ";"},
+        });
+    if (!response.has_value()) {
+        error_message = "YouTube WEB session request failed";
+        return {};
+    }
+
+    const size_t json_start = response->find('[');
+    if (json_start == std::string::npos) {
+        error_message = "YouTube WEB session parse failed";
+        return {};
+    }
+    const json data = json::parse(response->substr(json_start), nullptr, false);
+    if (data.is_discarded() || !data.is_array()) {
+        error_message = "YouTube WEB session parse failed";
+        return {};
+    }
+
+    try {
+        const json& device_info = data.at(0).at(2).at(0).at(0);
+        if (device_info.is_array() && device_info.size() > 13 && device_info.at(13).is_string()) {
+            return device_info.at(13).get<std::string>();
+        }
+    } catch (const json::exception&) {
+    }
+    error_message = "YouTube WEB visitorData missing";
+    return {};
+}
+#endif
+
+std::vector<HttpHeader> android_player_headers(const std::string& cookie = {}) {
+    std::vector<HttpHeader> headers = {
+        {"Content-Type", "application/json"},
+        {"User-Agent", kAndroidUserAgent},
+        {"X-Youtube-Client-Name", "3"},
+        {"X-Youtube-Client-Version", "20.10.38"},
+        {"Origin", "https://www.youtube.com"},
+    };
+    if (!cookie.empty()) {
+        headers.push_back({"Cookie", cookie});
+    }
+    return headers;
+}
+
+#ifdef __SWITCH__
+std::vector<HttpHeader> android_vr_player_headers() {
+    return {
+        {"Content-Type", "application/json"},
+        {"User-Agent", kAndroidVrUserAgent},
+        {"X-Youtube-Client-Name", "28"},
+        {"X-Youtube-Client-Version", "1.65.10"},
+        {"Origin", "https://www.youtube.com"},
+    };
+}
+
+void enable_ump(ResolvedPlayback& playback) {
+    playback.use_ump = true;
+    playback.quality_label = "720p AVC UMP";
+}
+#endif
 
 std::string extract_attribute(const std::string& line, const std::string& key) {
     const std::string pattern = key + "=";
@@ -694,13 +788,7 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
             {"hl", "en"},
             {"gl", "US"},
         },
-        {
-            {"Content-Type", "application/json"},
-            {"User-Agent", kAndroidUserAgent},
-            {"X-Youtube-Client-Name", "3"},
-            {"X-Youtube-Client-Version", "20.10.38"},
-            {"Origin", "https://www.youtube.com"},
-        },
+        android_player_headers(),
         error_message);
     if (!root.has_value()) {
         return std::nullopt;
@@ -743,16 +831,75 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
              video_id->c_str(),
              ios_error.c_str());
 
-        if (adaptive_playback.has_value()) {
-            report_status(on_status, "RESOLVING YOUTUBE STREAM", "REQUESTING 720P AVC STREAM");
-            auto result = *adaptive_playback;
-            if (progressive_playback.has_value()) {
-                result.fallback_stream_url = progressive_playback->stream_url;
-                result.fallback_referer = progressive_playback->referer;
-                result.fallback_http_header_fields = progressive_playback->http_header_fields;
-                result.fallback_quality_label = progressive_playback->quality_label;
+#ifdef __SWITCH__
+        // A normal GET of an adaptive format is cut off after the initial CDN
+        // burst. Android VR direct URLs do not require a PoToken when fetched
+        // as UMP: POST the tiny UMP request body for each range and unwrap the
+        // MEDIA parts. This avoids the system WebApplet entirely.
+        std::string ump_error;
+        const std::string visitor_data = fetch_web_visitor_data(client_, ump_error);
+        if (!visitor_data.empty() && adaptive_playback.has_value()) {
+            report_status(on_status, "RESOLVING YOUTUBE STREAM", "REQUESTING 720P UMP STREAM");
+            json vr_client = {
+                {"clientName", "ANDROID_VR"},
+                {"clientVersion", "1.65.10"},
+                {"androidSdkVersion", 32},
+                {"deviceMake", "Oculus"},
+                {"deviceModel", "Quest 3"},
+                {"hl", "en"},
+                {"gl", "US"},
+                {"visitorData", visitor_data},
+            };
+            const auto vr_root = fetch_player_response(
+                client_,
+                *video_id,
+                vr_client,
+                android_vr_player_headers(),
+                ump_error);
+            if (vr_root.has_value()) {
+                const json vr_streaming =
+                    vr_root->value("streamingData", json::object());
+                auto ump_playback = build_adaptive_split_playback(
+                    vr_streaming.value("adaptiveFormats", json::array()),
+                    *video_id,
+                    720);
+                if (ump_playback.has_value()) {
+                    enable_ump(*ump_playback);
+                    if (progressive_playback.has_value()) {
+                        ump_playback->fallback_stream_url = progressive_playback->stream_url;
+                        ump_playback->fallback_referer = progressive_playback->referer;
+                        ump_playback->fallback_http_header_fields = progressive_playback->http_header_fields;
+                        ump_playback->fallback_quality_label = progressive_playback->quality_label;
+                    }
+                    logf("youtube: selected tokenless Android VR UMP video=%s", video_id->c_str());
+                    return *ump_playback;
+                }
+                ump_error = "Android VR response did not contain 720p split formats";
+            }
+            logf("youtube: tokenless UMP path unavailable video=%s error=%s",
+                 video_id->c_str(), ump_error.c_str());
+        } else if (visitor_data.empty()) {
+            logf("youtube: UMP skipped video=%s error=%s", video_id->c_str(), ump_error.c_str());
+        }
+#endif
+
+        // Retain the reliable 360p fallback if Android VR UMP is unavailable.
+        if (progressive_playback.has_value()) {
+            report_status(on_status, "RESOLVING YOUTUBE STREAM", "REQUESTING PROGRESSIVE STREAM");
+            auto result = *progressive_playback;
+            if (adaptive_playback.has_value()) {
+                result.fallback_stream_url = adaptive_playback->stream_url;
+                result.fallback_referer = adaptive_playback->referer;
+                result.fallback_http_header_fields = adaptive_playback->http_header_fields;
+                result.fallback_quality_label = adaptive_playback->quality_label;
+                result.fallback_external_audio_url = adaptive_playback->external_audio_url;
             }
             return result;
+        }
+
+        if (adaptive_playback.has_value()) {
+            report_status(on_status, "RESOLVING YOUTUBE STREAM", "REQUESTING 720P AVC STREAM");
+            return *adaptive_playback;
         }
     }
 

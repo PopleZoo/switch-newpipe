@@ -233,7 +233,9 @@
       "contacting_player_api": "CONTACTING PLAYER API",
       "selecting_playable_format": "SELECTING PLAYABLE FORMAT",
       "requesting_720p_hls_stream": "REQUESTING 720P HLS STREAM",
-      "requesting_720p_avc_stream": "REQUESTING 720P AVC STREAM"
+      "requesting_720p_avc_stream": "REQUESTING 720P AVC STREAM",
+      "requesting_progressive_stream": "REQUESTING PROGRESSIVE STREAM",
+      "requesting_720p_ump_stream": "REQUESTING 720P UMP STREAM"
     }
   },
   "stream": {

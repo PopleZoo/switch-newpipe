@@ -74,6 +74,22 @@
 - `데이터 절약`에서 재생 성공 여부
 - 설정을 바꾼 뒤 체감 화질이나 로딩 특성이 달라지는지
 
+## 720p tokenless Android VR / UMP 실기 검증
+
+2026-07-17 `ruzSopZIFKc` 실기 시험에서 720p video 71,936,808 B와 AAC audio
+8,565,660 B 전체 다운로드 및 재생을 확인했다. 아래 항목은 회귀 시험 체크리스트다.
+
+- HLS가 없는 `bsRH-6Zmsjk`를 `표준 720p`로 실행했는지
+- 로딩 중 `GENERATING PLAYBACK TOKEN` 없이 `REQUESTING 720P UMP STREAM`으로 넘어가는지
+- OSD 품질이 `720P AVC UMP`인지
+- 1:04 이후에도 영상과 음성이 계속 재생되는지
+- 끝까지 재생하거나 로그의 UMP 다운로드가 `clen`까지 도달하는지
+- 실패 시 360p progressive로 자동 전환되어 재생 자체는 계속되는지
+- 로그에 다음 흐름이 있는지
+  - `youtube: selected tokenless Android VR UMP`
+  - `player: using tokenless Android VR UMP ranged download`
+- 실패하면 `youtube: UMP`, `player: UMP`가 포함된 로그 줄을 함께 보관할 것
+
 ## 설정 persistence
 
 - 설정 탭에서 `시작 탭` 변경 후 앱 재실행 시 반영되는지

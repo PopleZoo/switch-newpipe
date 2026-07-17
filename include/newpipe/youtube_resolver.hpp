@@ -29,6 +29,7 @@ struct ResolvedPlayback {
     std::string fallback_http_header_fields;
     std::string fallback_quality_label;
     std::string fallback_external_audio_url;
+    bool use_ump = false;
     bool is_live = false;
 };
 
