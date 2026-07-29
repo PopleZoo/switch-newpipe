@@ -8,10 +8,13 @@
 
 #include "newpipe/models.hpp"
 #include "newpipe/youtube_catalog_service.hpp"
+#include "view/auto_tab_frame.hpp"
 
-class SubscriptionsTab : public brls::Box {
+class SubscriptionsTab : public AttachedView {
 public:
     SubscriptionsTab();
+
+    void onCreate() override;
 
     static brls::View* create() { return new SubscriptionsTab(); }
 

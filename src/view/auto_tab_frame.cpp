@@ -770,7 +770,12 @@ AutoSidebarItem::AutoSidebarItem() : Box(brls::Axis::ROW) {
     this->registerAction(
         "hints/ok"_i18n, brls::BUTTON_A,
         [this](View* view) {
-            if (this->attachedView) brls::Application::giveFocus(this->attachedView);
+            // Only hand focus over when the tab really has something focusable.
+            // An empty tab resolves to a nullptr default focus, and giveFocus(nullptr)
+            // clears Application::currentFocus, which leaves navigation dead until the
+            // app is restarted. Keeping focus on the sidebar item is the safe fallback.
+            if (this->attachedView && this->attachedView->getDefaultFocus())
+                brls::Application::giveFocus(this->attachedView);
             return true;
         },
         false, false, brls::SOUND_CLICK_SIDEBAR);

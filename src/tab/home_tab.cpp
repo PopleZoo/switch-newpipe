@@ -8,6 +8,7 @@
 #include "newpipe/runtime.hpp"
 #include "newpipe/settings_store.hpp"
 #include "view/stream_card.hpp"
+#include "view/tab_focus.hpp"
 
 namespace {
 constexpr size_t kGridColumns = 4;
@@ -27,15 +28,6 @@ HomeTab::HomeTab() : service_() {
         }
     }
 
-    this->registerAction(newpipe::tr("common/refresh"), brls::ControllerButton::BUTTON_X, [this](brls::View*) {
-        loadHome();
-        return true;
-    });
-    this->registerAction(newpipe::tr("home/category_action"), brls::ControllerButton::BUTTON_Y, [this](brls::View*) {
-        cycleKiosk();
-        return true;
-    });
-
     if (statusLabel) {
         statusLabel->setText(newpipe::tr("home/preparing"));
     }
@@ -44,6 +36,19 @@ HomeTab::HomeTab() : service_() {
         newpipe::log_line("home: interaction ready");
     });
     scheduleLoadHome(250);
+}
+
+void HomeTab::onCreate() {
+    // Tab actions are mirrored on the sidebar item so they stay usable while the
+    // sidebar holds focus, and when the feed is empty and nothing here is focusable.
+    this->registerTabAction(newpipe::tr("common/refresh"), brls::ControllerButton::BUTTON_X, [this](brls::View*) {
+        loadHome();
+        return true;
+    });
+    this->registerTabAction(newpipe::tr("home/category_action"), brls::ControllerButton::BUTTON_Y, [this](brls::View*) {
+        cycleKiosk();
+        return true;
+    });
 }
 
 void HomeTab::loadHome() {
@@ -128,17 +133,7 @@ void HomeTab::buildGrid() {
     }
 
     newpipe::logf("home: buildGrid items=%zu", items_.size());
-    // borealis Application::giveFocus(nullptr) silently fails to clear currentFocus,
-    // so clearing the focused card via clearViews leaves a dangling pointer that the
-    // next ScrollingFrame frame dereferences. Move focus to scrollFrame first.
-    if (scrollFrame) {
-        for (brls::View* v = brls::Application::getCurrentFocus(); v; v = v->getParent()) {
-            if (v == gridBox) {
-                brls::Application::giveFocus(scrollFrame);
-                break;
-            }
-        }
-    }
+    newpipe::release_grid_focus(this, gridBox);
     gridBox->clearViews();
     for (size_t i = 0; i < items_.size(); i += kGridColumns) {
         auto* row = new brls::Box(brls::Axis::ROW);

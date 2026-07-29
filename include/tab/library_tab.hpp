@@ -7,10 +7,13 @@
 
 #include "newpipe/models.hpp"
 #include "newpipe/youtube_catalog_service.hpp"
+#include "view/auto_tab_frame.hpp"
 
-class LibraryTab : public brls::Box {
+class LibraryTab : public AttachedView {
 public:
     LibraryTab();
+
+    void onCreate() override;
 
     static brls::View* create() { return new LibraryTab(); }
 

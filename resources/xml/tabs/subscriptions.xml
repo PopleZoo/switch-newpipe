@@ -19,7 +19,7 @@
         id="subscriptions/body"
         width="auto"
         height="auto"
-        lineHeight="28"
+        lineHeight="1.55"
         text="RB로 세션 관리"
         fontSize="18"
         textColor="#D0D0D0"

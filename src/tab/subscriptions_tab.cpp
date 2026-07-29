@@ -8,6 +8,7 @@
 #include "newpipe/playback_helper.hpp"
 #include "newpipe/runtime.hpp"
 #include "view/stream_card.hpp"
+#include "view/tab_focus.hpp"
 
 namespace {
 constexpr size_t kGridColumns = 4;
@@ -18,16 +19,20 @@ SubscriptionsTab::SubscriptionsTab() : service_() {
     newpipe::log_line("subscriptions: construct");
     brls::delay(700, [this]() { interactionReady_.store(true); });
 
-    this->registerAction(newpipe::tr("common/refresh"), brls::ControllerButton::BUTTON_X, [this](brls::View*) {
+    this->refresh();
+}
+
+void SubscriptionsTab::onCreate() {
+    // Mirrored on the sidebar item: while signed out this tab has no focusable
+    // child, so a content-only action could never be triggered.
+    this->registerTabAction(newpipe::tr("common/refresh"), brls::ControllerButton::BUTTON_X, [this](brls::View*) {
         this->refresh();
         return true;
     });
-    this->registerAction(newpipe::tr("subscriptions/session_action"), brls::ControllerButton::BUTTON_RB, [this](brls::View*) {
+    this->registerTabAction(newpipe::tr("subscriptions/session_action"), brls::ControllerButton::BUTTON_RB, [this](brls::View*) {
         this->openSessionDialog();
         return true;
     });
-
-    this->refresh();
 }
 
 bool SubscriptionsTab::allowInitialInput() const {
@@ -116,16 +121,7 @@ void SubscriptionsTab::buildGrid() {
         return;
     }
 
-    // See HomeTab::buildGrid — work around borealis giveFocus(nullptr) no-op
-    // that would leave a dangling currentFocus after clearing the focused card.
-    if (this->scrollFrame) {
-        for (brls::View* v = brls::Application::getCurrentFocus(); v; v = v->getParent()) {
-            if (v == this->gridBox) {
-                brls::Application::giveFocus(this->scrollFrame);
-                break;
-            }
-        }
-    }
+    newpipe::release_grid_focus(this, this->gridBox);
     this->gridBox->clearViews();
     for (size_t i = 0; i < this->items_.size(); i += kGridColumns) {
         auto* row = new brls::Box(brls::Axis::ROW);
@@ -154,14 +150,7 @@ void SubscriptionsTab::buildGrid() {
 void SubscriptionsTab::clearGrid() {
     this->items_.clear();
     if (this->gridBox) {
-        if (this->scrollFrame) {
-            for (brls::View* v = brls::Application::getCurrentFocus(); v; v = v->getParent()) {
-                if (v == this->gridBox) {
-                    brls::Application::giveFocus(this->scrollFrame);
-                    break;
-                }
-            }
-        }
+        newpipe::release_grid_focus(this, this->gridBox);
         this->gridBox->clearViews();
     }
 }

@@ -8,10 +8,13 @@
 
 #include "newpipe/models.hpp"
 #include "newpipe/youtube_catalog_service.hpp"
+#include "view/auto_tab_frame.hpp"
 
-class SearchTab : public brls::Box {
+class SearchTab : public AttachedView {
 public:
     SearchTab();
+
+    void onCreate() override;
 
     static brls::View* create() { return new SearchTab(); }
 

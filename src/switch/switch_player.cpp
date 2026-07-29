@@ -530,10 +530,48 @@ private:
         }
         info->cookie = stream;
         info->read_fn = &SwitchPlayer::stream_read;
-        info->seek_fn = nullptr;
+        info->seek_fn = &SwitchPlayer::stream_seek;
+        // size_fn stays null on purpose. The demuxer does not need the total size
+        // to seek by byte offset, and with an unknown size ffmpeg cannot attempt
+        // SEEK_END. That matters for fragmented MP4: a seekable stream with a known
+        // size makes mov_read_mfra() jump to the end of the file for the fragment
+        // index, which for a partially downloaded cache file is the one offset we
+        // can never serve.
         info->size_fn = nullptr;
         info->close_fn = &SwitchPlayer::stream_close;
         return 0;
+    }
+
+    // Seeks are served straight out of the download cache file, so only bytes that
+    // already landed can be reached. Targets past the buffered edge are rejected
+    // instead of waited for: the downloader walks the stream strictly forward, so
+    // blocking on a far target would stall the demuxer for as long as the rest of
+    // the download takes.
+    static int64_t stream_seek(void* cookie, int64_t offset) {
+        auto* stream = static_cast<StreamSession*>(cookie);
+        if (!stream || !stream->player) {
+            return MPV_ERROR_GENERIC;
+        }
+        if (offset < 0) {
+            return MPV_ERROR_UNSUPPORTED;
+        }
+
+        auto* player = stream->player;
+        const auto target = static_cast<uint64_t>(offset);
+        if (stream->is_audio) {
+            std::lock_guard<std::mutex> lock(player->audio_mutex_);
+            if (player->audio_cache_fd_ < 0 || target > player->audio_downloaded_bytes_.load()) {
+                return MPV_ERROR_UNSUPPORTED;
+            }
+        } else {
+            std::lock_guard<std::mutex> lock(player->stream_mutex_);
+            if (player->stream_cache_fd_ < 0 || target > player->streamed_bytes_) {
+                return MPV_ERROR_UNSUPPORTED;
+            }
+        }
+
+        stream->position = static_cast<size_t>(target);
+        return offset;
     }
 
     static int64_t stream_read(void* cookie, char* buffer, uint64_t bytes) {
@@ -699,7 +737,8 @@ private:
         last_osd_refresh_ = now;
 
         double value = 0.0;
-        if (mpv_get_property(mpv_, "time-pos", MPV_FORMAT_DOUBLE, &value) >= 0 && std::isfinite(value)) {
+        if (mpv_get_property(mpv_, "time-pos", MPV_FORMAT_DOUBLE, &value) >= 0 && std::isfinite(value)
+            && now >= osd_time_hold_until_) {
             last_time_pos_ = std::max(0.0, value);
         }
         if (mpv_get_property(mpv_, "duration", MPV_FORMAT_DOUBLE, &value) >= 0 && std::isfinite(value)) {
@@ -2179,6 +2218,18 @@ private:
             case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
                 change_volume(-5, force_redraw);
                 break;
+            case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
+                seek_relative(-kShortSeekSeconds, force_redraw);
+                break;
+            case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
+                seek_relative(kShortSeekSeconds, force_redraw);
+                break;
+            case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:
+                seek_relative(-kLongSeekSeconds, force_redraw);
+                break;
+            case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER:
+                seek_relative(kLongSeekSeconds, force_redraw);
+                break;
             default:
                 break;
         }
@@ -2257,6 +2308,144 @@ private:
         refresh_osd_snapshot(true);
         logf("player: volume delta=%d", delta);
         force_redraw = true;
+    }
+
+    // Fraction of the stream sitting in the cache files. Returns nothing when the
+    // amount cannot be established, which keeps callers from guessing.
+    std::optional<double> buffered_ratio() const {
+        if (!use_stream_bridge_) {
+            return std::nullopt;
+        }
+
+        size_t downloaded = 0;
+        bool done = false;
+        bool success = false;
+        {
+            std::lock_guard<std::mutex> lock(stream_mutex_);
+            downloaded = streamed_bytes_;
+            done = stream_download_done_;
+            success = stream_download_success_;
+        }
+
+        double ratio = 1.0;
+        if (!(done && success)) {
+            if (stream_total_bytes_ == 0) {
+                return std::nullopt;
+            }
+            ratio = static_cast<double>(downloaded) / static_cast<double>(stream_total_bytes_);
+        }
+
+        // A split audio track is downloaded on its own thread and can lag behind the
+        // video, and a seek has to land inside both caches.
+        if (!active_external_audio_url_.empty()) {
+            if (audio_download_done_.load() && audio_download_success_.load()) {
+                // fully cached, video ratio decides
+            } else if (audio_total_bytes_ == 0) {
+                return std::nullopt;
+            } else {
+                ratio = std::min(
+                    ratio,
+                    static_cast<double>(audio_downloaded_bytes_.load())
+                        / static_cast<double>(audio_total_bytes_));
+            }
+        }
+
+        return clamp_double(ratio, 0.0, 1.0);
+    }
+
+    // Last position a seek can currently reach, in seconds. Bytes are mapped onto
+    // time linearly, which is only an approximation for a variable bitrate track but
+    // errs on the conservative side often enough to be a useful guard. Returns
+    // nothing when the whole stream is cached or the limit cannot be computed, in
+    // which case seeking is left entirely to mpv.
+    std::optional<double> buffered_seek_limit_seconds() const {
+        if (last_duration_ <= 1.0) {
+            return std::nullopt;
+        }
+
+        const auto ratio = buffered_ratio();
+        if (!ratio.has_value() || *ratio >= 0.999) {
+            return std::nullopt;
+        }
+
+        return last_duration_ * *ratio;
+    }
+
+    bool is_media_seekable() const {
+        if (!mpv_) {
+            return false;
+        }
+
+        int flag = 0;
+        if (mpv_get_property(mpv_, "seekable", MPV_FORMAT_FLAG, &flag) < 0) {
+            // Property not readable yet: let mpv reject the command itself instead of
+            // refusing the input here.
+            return true;
+        }
+        return flag != 0;
+    }
+
+    void seek_relative(double delta_seconds, bool& force_redraw) {
+        if (!mpv_ || !first_frame_rendered_.load()) {
+            return;
+        }
+
+        force_redraw = true;
+        if (active_is_live_) {
+            show_osd_message(newpipe::tr("player/osd/seek_live"), 2000);
+            return;
+        }
+
+        refresh_osd_snapshot(true);
+        if (last_duration_ <= 1.0 || !is_media_seekable()) {
+            show_osd_message(newpipe::tr("player/osd/seek_unavailable"), 2000);
+            return;
+        }
+
+        // Stop just short of the end so a forward seek cannot run into EOF.
+        double target = clamp_double(
+            last_time_pos_ + delta_seconds, 0.0, std::max(0.0, last_duration_ - 1.0));
+
+        bool limited = false;
+        if (const auto limit = buffered_seek_limit_seconds()) {
+            // Stay a couple of seconds inside the buffered edge: the demuxer reads
+            // ahead of the position it seeks to.
+            const double safe_limit = std::max(0.0, *limit - 2.0);
+            if (target > safe_limit) {
+                target = safe_limit;
+                limited = true;
+            }
+
+            if (delta_seconds > 0.0 && target <= last_time_pos_ + 0.5) {
+                show_osd_message(
+                    newpipe::tr("player/osd/seek_buffer_limit", format_playback_time(*limit)), 2500);
+                logf("player: seek refused, buffered up to %.1fs pos=%.1fs", *limit, last_time_pos_);
+                return;
+            }
+        }
+
+        char target_text[32];
+        std::snprintf(target_text, sizeof(target_text), "%.3f", target);
+        const char* command[] = {"seek", target_text, "absolute", nullptr};
+        // Async: a seek on the cache bridge can block on file IO, and this runs on
+        // the render thread.
+        if (mpv_command_async(mpv_, 0, command) < 0) {
+            show_osd_message(newpipe::tr("player/osd/seek_unavailable"), 2000);
+            return;
+        }
+
+        last_time_pos_ = target;
+        osd_time_hold_until_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(600);
+        show_osd_message(
+            newpipe::tr(
+                "player/osd/seek",
+                format_playback_time(target),
+                format_playback_time(last_duration_)),
+            2500);
+        logf("player: seek delta=%.1f target=%.3f limited=%d",
+             delta_seconds,
+             target,
+             limited ? 1 : 0);
     }
 
     void render_loading_screen(int phase) {
@@ -2515,7 +2704,8 @@ private:
     bool fallback_attempted_ = false;
     bool use_stream_bridge_ = false;
     bool file_loaded_ = false;
-    bool first_frame_rendered_ = false;
+    // Read from the mpv render/event thread and the SDL input path, so keep it atomic.
+    std::atomic<bool> first_frame_rendered_{false};
     bool osd_pinned_ = false;
     std::thread stream_download_thread_;
     std::string stream_cache_path_;
@@ -2528,6 +2718,11 @@ private:
     std::condition_variable stream_cv_;
     std::condition_variable audio_cv_;
     size_t streamed_bytes_ = 0;
+    // Total byte size of each cached track when the URL advertises it, used to map
+    // downloaded bytes onto playable seconds for the seek guard and the OSD buffer
+    // bar. Never handed to mpv, see stream_open.
+    uint64_t stream_total_bytes_ = 0;
+    uint64_t audio_total_bytes_ = 0;
     bool stream_download_done_ = false;
     bool stream_download_success_ = false;
     std::string stream_download_error_;
@@ -2542,6 +2737,9 @@ private:
     std::chrono::steady_clock::time_point load_started_at_{};
     std::chrono::steady_clock::time_point osd_visible_until_{};
     std::chrono::steady_clock::time_point last_osd_refresh_{};
+    // While a seek is in flight mpv keeps reporting the old time-pos for a moment,
+    // so hold the OSD on the requested position instead of letting it snap back.
+    std::chrono::steady_clock::time_point osd_time_hold_until_{};
     std::chrono::steady_clock::time_point player_input_ready_at_{};
     std::string osd_title_ = clamp_text(uppercase_ascii(request_.title), 52);
     std::string osd_message_;

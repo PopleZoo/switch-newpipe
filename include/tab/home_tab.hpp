@@ -8,10 +8,13 @@
 #include "newpipe/models.hpp"
 #include "newpipe/settings_store.hpp"
 #include "newpipe/youtube_catalog_service.hpp"
+#include "view/auto_tab_frame.hpp"
 
-class HomeTab : public brls::Box {
+class HomeTab : public AttachedView {
 public:
     HomeTab();
+
+    void onCreate() override;
 
     static brls::View* create() { return new HomeTab(); }
 
