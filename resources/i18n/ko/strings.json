@@ -196,14 +196,18 @@
       "playing": "재생 중",
       "volume": "볼륨"
     },
-    "osd_controls": "A 일시정지  B 뒤로  X Y OSD  위 아래 볼륨",
+    "osd_controls": "A 일시정지  B 뒤로  XY OSD  위아래 볼륨  좌우 10초  LB RB 60초",
     "osd": {
       "auto": "OSD 자동",
       "locked": "OSD 고정",
       "audio_download_failed": "오디오 다운로드 실패",
       "audio_attach_failed": "오디오 연결 실패",
       "playback_ready": "재생 준비 완료",
-      "volume": "볼륨 {}"
+      "volume": "볼륨 {}",
+      "seek": "이동 {} / {}",
+      "seek_unavailable": "이동 불가",
+      "seek_live": "라이브는 이동 불가",
+      "seek_buffer_limit": "{} 까지 받음"
     },
     "loading": {
       "preparing_playback": "재생 준비 중",

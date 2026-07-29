@@ -196,14 +196,18 @@
       "playing": "PLAYING",
       "volume": "VOL"
     },
-    "osd_controls": "A PAUSE  B BACK  X Y OSD  UP DOWN VOL",
+    "osd_controls": "A PAUSE  B BACK  XY OSD  UPDN VOL  PAD 10S  LBRB 60S",
     "osd": {
       "auto": "OSD AUTO",
       "locked": "OSD LOCKED",
       "audio_download_failed": "AUDIO DOWNLOAD FAILED",
       "audio_attach_failed": "AUDIO ATTACH FAILED",
       "playback_ready": "PLAYBACK READY",
-      "volume": "VOLUME {}"
+      "volume": "VOLUME {}",
+      "seek": "SEEK {} / {}",
+      "seek_unavailable": "SEEK UNAVAILABLE",
+      "seek_live": "LIVE STREAM NO SEEK",
+      "seek_buffer_limit": "BUFFERED TO {}"
     },
     "loading": {
       "preparing_playback": "PREPARING PLAYBACK",

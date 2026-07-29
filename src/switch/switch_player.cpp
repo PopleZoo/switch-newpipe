@@ -48,6 +48,8 @@ constexpr const char* kUmpDownloadUserAgent =
 constexpr const char* kProtocolPrefix = "switchcache://";
 constexpr float kPi = 3.14159265f;
 constexpr size_t kInitialStreamBufferBytes = 512 * 1024;
+constexpr double kShortSeekSeconds = 10.0;
+constexpr double kLongSeekSeconds = 60.0;
 
 std::string translate_loading_text(const std::string& value) {
     if (value == "RESOLVING YOUTUBE STREAM") {
@@ -872,6 +874,18 @@ private:
         if (active_is_live_) {
             fill_rect(bar_x, bar_y, std::max(72, bar_width / 5), bar_height, height, 0.92f, 0.20f, 0.18f);
         } else if (last_duration_ > 1.0) {
+            // How far the cache reaches, i.e. how far a seek can currently land.
+            if (const auto buffered = buffered_ratio()) {
+                fill_rect(
+                    bar_x,
+                    bar_y,
+                    static_cast<int>(std::round(bar_width * *buffered)),
+                    bar_height,
+                    height,
+                    0.42f,
+                    0.42f,
+                    0.42f);
+            }
             const double ratio = clamp_double(last_time_pos_ / last_duration_, 0.0, 1.0);
             fill_rect(bar_x, bar_y, static_cast<int>(std::round(bar_width * ratio)), bar_height, height, 0.95f, 0.95f, 0.95f);
         }
@@ -929,6 +943,8 @@ private:
         audio_attach_attempted_ = false;
         audio_wait_logged_ = false;
         audio_download_error_.clear();
+        stream_total_bytes_ = 0;
+        audio_total_bytes_ = 0;
         active_url_ = request_.url;
         active_referer_ = request_.referer;
         active_http_header_fields_ = request_.http_header_fields;
@@ -1048,6 +1064,7 @@ private:
             stream_download_success_ = false;
             stream_download_error_.clear();
         }
+        stream_total_bytes_ = 0;
 
         if (!stream_cache_path_.empty()) {
             std::remove(stream_cache_path_.c_str());
@@ -1301,6 +1318,7 @@ private:
             stream_download_error_.clear();
         }
 
+        stream_total_bytes_ = find_query_u64(active_url_, "clen").value_or(0);
         stream_abort_.store(false);
         last_progress_update_ = std::chrono::steady_clock::time_point{};
         stream_download_thread_ = std::thread([this]() {
@@ -1561,6 +1579,7 @@ private:
             return;
         }
 
+        audio_total_bytes_ = find_query_u64(source_url, "clen").value_or(0);
         audio_prefetch_min_bytes_ = contains_case_insensitive(source_url, "googlevideo.com/videoplayback")
             ? 1024 * 1024
             : 0;
@@ -1791,6 +1810,7 @@ private:
         audio_download_done_.store(false);
         audio_download_success_.store(false);
         audio_downloaded_bytes_.store(0);
+        audio_total_bytes_ = 0;
         audio_prefetch_min_bytes_ = 0;
         audio_attach_attempted_ = false;
         audio_wait_logged_ = false;
@@ -2262,6 +2282,19 @@ private:
             case 15:
                 change_volume(-5, force_redraw);
                 break;
+            // HidNpadButton bit order: 6 L, 7 R, 12 Left, 14 Right.
+            case 12:
+                seek_relative(-kShortSeekSeconds, force_redraw);
+                break;
+            case 14:
+                seek_relative(kShortSeekSeconds, force_redraw);
+                break;
+            case 6:
+                seek_relative(-kLongSeekSeconds, force_redraw);
+                break;
+            case 7:
+                seek_relative(kLongSeekSeconds, force_redraw);
+                break;
             default:
                 break;
         }
@@ -2272,6 +2305,10 @@ private:
             change_volume(5, force_redraw);
         } else if (hat_value & SDL_HAT_DOWN) {
             change_volume(-5, force_redraw);
+        } else if (hat_value & SDL_HAT_LEFT) {
+            seek_relative(-kShortSeekSeconds, force_redraw);
+        } else if (hat_value & SDL_HAT_RIGHT) {
+            seek_relative(kShortSeekSeconds, force_redraw);
         }
     }
 

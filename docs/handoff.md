@@ -1,5 +1,34 @@
 # Handoff
 
+## 좌우 seek 복구 (2026-07-29)
+
+roadmap Phase 2의 `좌우 seek 복구` 항목. `좌 / 우` 10초, `LB / RB` 60초다.
+
+- HLS / manifest 경로는 mpv가 세그먼트를 직접 가져오므로 전체 구간 이동이 된다.
+- 스트림 브리지 경로는 `switchcache` stream callback에 `seek_fn`을 붙였고, 이미
+  캐시에 받아둔 바이트 안에서만 성공한다. 다운로더가 앞으로만 진행하므로 아직 안
+  받은 offset을 기다리면 demuxer가 남은 다운로드 내내 멈춘다. 그래서 기다리지 않고
+  거절한다.
+- `clen`이 있으면 `받은 바이트 / 총 바이트`를 시간으로 환산해 버퍼 끝 2초 앞까지만
+  이동을 허용하고, 막히면 OSD에 `BUFFERED TO mm:ss`를 띄운다. 분리 오디오가 있으면
+  video / audio 중 느린 쪽 비율을 쓴다.
+- `size_fn`은 일부러 null이다. byte offset 이동에 총 크기는 필요 없고, 크기를 주면
+  fragmented MP4에서 ffmpeg가 fragment index를 찾아 파일 끝으로 이동하려 한다.
+  부분만 받은 캐시 파일에서 못 주는 offset이 정확히 그 위치다.
+- OSD 진행 바에 버퍼 구간을 밝은 회색으로 같이 그린다. 이동 직후에는 mpv가 잠깐
+  이전 `time-pos`를 돌려주므로 600ms 동안 OSD 시간을 요청 위치에 고정한다.
+- 검증
+  - `./build.sh` 통과. `switch_newpipe.nro` 빌드까지 확인했고 앱 소스 경고는 없다
+  - `src/switch/switch_player.cpp`는 switch/SDL/mpv 헤더가 필요해서 호스트
+    `g++ -fsyntax-only`로는 볼 수 없다. 이 파일 변경은 `./build.sh`가 유일한 정적 검증
+    경로다
+  - 로컬 빌드에는 `git submodule update --init --recursive`가 필요하다.
+    `vendor/quickjs`가 비어 있으면 CMake가 `does not contain a CMakeLists.txt`로 죽는다.
+    CI는 `actions/checkout`의 `submodules: recursive`로 해결하고 있어서 로컬에서만 걸린다
+  - **실기 동작은 아직 확인하지 않았다.** 체크 항목은 `docs/testing.md`의 시간 이동 절
+  - 재생 자체가 깨지는 회귀가 나오면 `stream_open`의 `seek_fn`을 `nullptr`로 되돌려
+    seek만 끄면 이전 동작으로 복귀한다. 720p UMP 경로가 실기 검증된 경로다
+
 ## 최근 수정 (2026-07-29)
 
 GitHub issue #3 / #4 대응. 둘 다 UI 레이어 버그다.

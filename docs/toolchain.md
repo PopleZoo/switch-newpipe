@@ -17,7 +17,12 @@
 
 실제 빌드 의존성은 `vendor/borealis`, `vendor/lunasvg`, `vendor/third_party`, `vendor/switch-portlibs`에 vendoring 되어 있다.
 
+단 `vendor/quickjs`는 vendoring이 아니라 서브모듈이다. 새로 clone 했으면 먼저 받아야
+한다. 비어 있으면 CMake가 `vendor/quickjs does not contain a CMakeLists.txt`로 죽는다.
+CI는 `actions/checkout`의 `submodules: recursive`로 자동 처리한다.
+
 ```bash
+git submodule update --init --recursive
 ./build.sh
 ```
 

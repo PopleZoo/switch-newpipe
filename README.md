@@ -53,7 +53,12 @@
 | `A` | Pause / Resume |
 | `B` | Exit player |
 | `Up / Down` | Volume |
+| `Left / Right` | Seek 10 seconds |
+| `LB / RB` | Seek 60 seconds |
 | `X / Y` | Toggle OSD overlay |
+
+On progressive and UMP streams you can only seek inside the part that has already
+been downloaded; the OSD progress bar shows that range and the reachable limit.
 
 ## Login (Optional)
 
