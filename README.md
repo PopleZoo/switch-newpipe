@@ -15,8 +15,8 @@
 
 ## Screenshots
 
-| Home Feed | Player (720p) |
-|:-:|:-:|
+|           Home Feed          |          Player (720p)         |
+| :--------------------------: | :----------------------------: |
 | ![home](./docs/preview2.jpg) | ![player](./docs/preview1.jpg) |
 
 ## Install
@@ -26,39 +26,101 @@
 3. Copy it to `sdmc:/switch/switch_newpipe.nro`
 4. Launch from the Homebrew Menu
 
+## Fork Changes
+
+This fork adds a number of playback, UI, and usability improvements to the original project.
+
+### Progressive Playback
+
+Playback now starts after approximately **1 MB** has been downloaded instead of waiting for the entire stream to become available.
+
+The remaining data continues downloading in the background while you watch.
+
+### Tokenless 720p Streaming
+
+Adds **tokenless 720p streaming** through the Android VR UMP path using **4 MB chunks**.
+
+Ratebypass fallbacks also support chunked streaming, improving compatibility with streams that cannot use the primary UMP path.
+
+### Seek Outside the Buffer
+
+Seeking is no longer restricted to the portion of the video that has already been downloaded.
+
+* **Left / Right:** Seek ±10 seconds
+* **LB / RB:** Seek ±60 seconds
+* Seeking outside the downloaded range automatically restarts the downloader from the target byte position.
+
+This allows jumping forward through a video without waiting for the entire section between the current position and the target to download.
+
+### In-Playback Quality Picker
+
+Press **X** during playback to open the quality selection menu.
+
+Available options include:
+
+* **AUTO**
+* Any available video resolution
+
+Changing quality preserves the current playback position.
+
+### Continue Watching
+
+Playback position is automatically saved:
+
+* Every **10 seconds**
+* When playback is paused
+* When exiting the player
+
+Videos resume from the last saved position when opened again.
+
+### Enlarged Two-Column Selection UI
+
+The selection interface has been redesigned for easier navigation on the Switch.
+
+* Larger selectable items
+* Two-column layout
+* Better use of available screen space
+* Easier navigation with a controller
+
+---
+
 ## What You Can Do
 
-- Browse **Home**, **Search**, **Subscriptions**, **Library**, and **Settings**
-- Watch YouTube at **720p** (HLS streaming, no throttle)
-- Search for any video and play it immediately
-- Log in with cookies to see your subscriptions and personalized recommendations
-- Save watch history and favorites locally
-- English & Korean UI
+* Browse **Home**, **Search**, **Subscriptions**, **Library**, and **Settings**
+* Watch YouTube at **720p**
+* Start playback while the stream is still downloading
+* Seek through videos, including positions outside the downloaded buffer
+* Change playback quality without leaving the player
+* Search for any video and play it immediately
+* Log in with cookies to see your subscriptions and personalized recommendations
+* Save watch history and favorites locally
+* Resume videos from their previous playback position
+* English & Korean UI
 
 ## Controls
 
 ### Main UI
 
-| Button | Action |
-|--------|--------|
-| `A` | Play video from list |
-| `Y` | Open video details |
-| `X` | Refresh / Reset defaults |
-| `RB` | Manage login session (Subscriptions tab) |
+| Button | Action                                   |
+| ------ | ---------------------------------------- |
+| `A`    | Play video from list                     |
+| `Y`    | Open video details                       |
+| `X`    | Refresh / Reset defaults                 |
+| `RB`   | Manage login session (Subscriptions tab) |
 
 ### Player
 
-| Button | Action |
-|--------|--------|
-| `A` | Pause / Resume |
-| `B` | Exit player |
-| `Up / Down` | Volume |
-| `Left / Right` | Seek 10 seconds |
-| `LB / RB` | Seek 60 seconds |
-| `X / Y` | Toggle OSD overlay |
+| Button         | Action                 |
+| -------------- | ---------------------- |
+| `A`            | Pause / Resume         |
+| `B`            | Exit player            |
+| `Up / Down`    | Volume                 |
+| `Left / Right` | Seek 10 seconds        |
+| `LB / RB`      | Seek 60 seconds        |
+| `X`            | Open quality selection |
+| `Y`            | Toggle OSD overlay     |
 
-On progressive and UMP streams you can only seek inside the part that has already
-been downloaded; the OSD progress bar shows that range and the reachable limit.
+Seeking outside the currently downloaded range automatically restarts the downloader at the requested position.
 
 ## Login (Optional)
 
@@ -66,7 +128,7 @@ Switch-NewPipe uses cookie import for YouTube login. No OAuth or Google sign-in 
 
 **How to set up:**
 
-1. Export your YouTube cookies from a browser (using a cookie export extension)
+1. Export your YouTube cookies from a browser using a cookie export extension
 2. Save the file as `sdmc:/switch/switch_newpipe_auth.txt`
 3. Restart the app
 
@@ -76,25 +138,27 @@ Once logged in, your **Subscriptions** tab and **personalized Home recommendatio
 
 ## Playback Quality
 
-Configure in **Settings** tab:
+Configure the default playback mode in **Settings**:
 
-| Mode | Description |
-|------|-------------|
-| **Standard 720p** | Best quality. Tries 720p HLS first, falls back gracefully |
-| **Compatibility** | Prefers progressive MP4 (video+audio combined) |
-| **Data Saver** | Lower quality around 480p to save bandwidth |
+| Mode              | Description                                                        |
+| ----------------- | ------------------------------------------------------------------ |
+| **Standard 720p** | Best quality. Tries 720p streaming first and falls back gracefully |
+| **Compatibility** | Prefers progressive MP4 (video + audio combined)                   |
+| **Data Saver**    | Lower quality around 480p to save bandwidth                        |
+
+The player also provides an **in-playback quality picker** through `X`, allowing the quality to be changed without leaving the video.
 
 ## Data Files
 
 All data is stored on your SD card:
 
-| File | Purpose |
-|------|---------|
-| `sdmc:/switch/switch_newpipe.log` | Debug log |
-| `sdmc:/switch/switch_newpipe_settings.json` | Settings |
-| `sdmc:/switch/switch_newpipe_library.json` | Watch history & favorites |
-| `sdmc:/switch/switch_newpipe_session.json` | Login session |
-| `sdmc:/switch/switch_newpipe_auth.txt` | Cookie import (you provide this) |
+| File                                        | Purpose                          |
+| ------------------------------------------- | -------------------------------- |
+| `sdmc:/switch/switch_newpipe.log`           | Debug log                        |
+| `sdmc:/switch/switch_newpipe_settings.json` | Settings                         |
+| `sdmc:/switch/switch_newpipe_library.json`  | Watch history & favorites        |
+| `sdmc:/switch/switch_newpipe_session.json`  | Login session                    |
+| `sdmc:/switch/switch_newpipe_auth.txt`      | Cookie import (you provide this) |
 
 ## Build from Source
 
@@ -127,18 +191,16 @@ make host
 
 ## Known Limitations
 
-- Seek is not yet supported
-- No in-app quality picker during playback
-- No in-app Google OAuth (cookie import only)
-- Channel pages are not fully browsable yet
-- Comments and playlists load first page only
+* No in-app Google OAuth (cookie import only)
+* Channel pages are not fully browsable yet
+* Comments and playlists load first page only
 
 ## Tech Stack
 
-- **UI**: [Borealis](https://github.com/natinusala/borealis) (native Switch UI framework)
-- **Playback**: mpv + FFmpeg (hardware-accelerated on Switch)
-- **Networking**: libcurl + custom YouTube innertube API client
-- **Build**: CMake, Docker, devkitPro toolchain
+* **UI**: [Borealis](https://github.com/natinusala/borealis) (native Switch UI framework)
+* **Playback**: mpv + FFmpeg (hardware-accelerated on Switch)
+* **Networking**: libcurl + custom YouTube Innertube API client
+* **Build**: CMake, Docker, devkitPro toolchain
 
 ## License
 
