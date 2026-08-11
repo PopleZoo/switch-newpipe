@@ -1,4 +1,4 @@
-# Switch-NewPipe
+# Switch-NewPipe (Out of date)
 
 ![preview2](./docs/preview2.jpg)
 ![preview1](./docs/preview1.jpg)
