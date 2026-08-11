@@ -16,7 +16,7 @@
                 sidebarWidth="160">
 
             <Tab
-                    label="@i18n/app/home"
+                    label=""
                     fontSize="18"
                     icon="@res/svg/home.svg"
                     iconActivate="@res/svg/home_active.svg">
@@ -24,7 +24,7 @@
             </Tab>
 
             <Tab
-                    label="@i18n/app/search"
+                    label=""
                     fontSize="18"
                     icon="@res/svg/search.svg"
                     iconActivate="@res/svg/search_active.svg">
@@ -32,7 +32,7 @@
             </Tab>
 
             <Tab
-                    label="@i18n/app/subscriptions"
+                    label=""
                     fontSize="18"
                     icon="@res/svg/subscriptions.svg"
                     iconActivate="@res/svg/subscriptions_active.svg">
@@ -40,7 +40,7 @@
             </Tab>
 
             <Tab
-                    label="@i18n/app/library"
+                    label=""
                     fontSize="18"
                     icon="@res/svg/library.svg"
                     iconActivate="@res/svg/library_active.svg">
@@ -48,7 +48,7 @@
             </Tab>
 
             <Tab
-                    label="@i18n/app/settings"
+                    label=""
                     fontSize="18"
                     icon="@res/svg/settings.svg"
                     iconActivate="@res/svg/settings_active.svg">

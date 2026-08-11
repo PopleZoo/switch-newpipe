@@ -10,7 +10,7 @@
 #include "view/tab_focus.hpp"
 
 namespace {
-constexpr size_t kGridColumns = 4;
+constexpr size_t kGridColumns = 2;
 }
 
 SearchTab::SearchTab() : service_() {
@@ -60,6 +60,8 @@ void SearchTab::doSearch(const std::string& query) {
 
     if (query.empty()) {
         items_.clear();
+        hasMore_ = false;
+        loadingMore_ = false;
         if (gridBox) {
             newpipe::release_grid_focus(this, gridBox);
             gridBox->clearViews();
@@ -75,7 +77,8 @@ void SearchTab::doSearch(const std::string& query) {
 
     const auto results = service_.search(query);
     items_ = results.items;
-    newpipe::logf("search: results=%zu", items_.size());
+    hasMore_ = !results.continuation_token.empty();
+    newpipe::logf("search: results=%zu hasMore=%d", items_.size(), hasMore_ ? 1 : 0);
     buildGrid();
 
     if (statusLabel) {
@@ -102,6 +105,7 @@ void SearchTab::buildGrid() {
 
     newpipe::logf("search: buildGrid items=%zu", items_.size());
     newpipe::release_grid_focus(this, gridBox);
+    loadMoreSubscriptions_.clear();
     gridBox->clearViews();
     for (size_t i = 0; i < items_.size(); i += kGridColumns) {
         auto* row = new brls::Box(brls::Axis::ROW);
@@ -125,6 +129,93 @@ void SearchTab::buildGrid() {
 
         gridBox->addView(row);
     }
+
+    attachLoadMoreTriggers();
+}
+
+void SearchTab::appendGridRows(size_t start_index) {
+    if (!gridBox) {
+        return;
+    }
+
+    for (size_t i = start_index; i < items_.size(); i += kGridColumns) {
+        auto* row = new brls::Box(brls::Axis::ROW);
+        row->setMarginBottom(8);
+
+        for (size_t j = i; j < i + kGridColumns && j < items_.size(); j++) {
+            auto* card = new StreamCard();
+            card->setData(items_[j]);
+            const size_t idx = j;
+            card->registerClickAction([this, idx](brls::View*) {
+                playStream(items_[idx]);
+                return true;
+            });
+            card->registerAction(newpipe::tr("common/info"), brls::ControllerButton::BUTTON_Y, [this, idx](brls::View*) {
+                openStream(items_[idx]);
+                return true;
+            });
+            card->addGestureRecognizer(new brls::TapGestureRecognizer(card));
+            row->addView(card);
+        }
+
+        gridBox->addView(row);
+    }
+
+    attachLoadMoreTriggers();
+}
+
+void SearchTab::attachLoadMoreTriggers() {
+    if (!gridBox || !hasMore_ || loadingMore_) {
+        return;
+    }
+
+    auto& children = gridBox->getChildren();
+    if (children.size() < 2) {
+        return;
+    }
+
+    for (size_t r = children.size() - 2; r < children.size(); r++) {
+        auto* row = dynamic_cast<brls::Box*>(children[r]);
+        if (!row) {
+            continue;
+        }
+        for (brls::View* card : row->getChildren()) {
+            loadMoreSubscriptions_.push_back(card->getFocusEvent()->subscribe([this](brls::View*) {
+                this->loadMore();
+            }));
+        }
+    }
+}
+
+void SearchTab::loadMore() {
+    if (loadingMore_ || !hasMore_) {
+        return;
+    }
+    if (lastQuery_.empty()) {
+        return;
+    }
+
+    loadingMore_ = true;
+    newpipe::log_line("search: loadMore start");
+    const auto results = service_.search_more(lastQuery_);
+    if (results.items.empty()) {
+        hasMore_ = false;
+        loadingMore_ = false;
+        newpipe::logf("search: loadMore failed error=%s", service_.error_message().c_str());
+        return;
+    }
+
+    const size_t old_size = items_.size();
+    items_.insert(items_.end(), results.items.begin(), results.items.end());
+    hasMore_ = !results.continuation_token.empty();
+    newpipe::logf("search: loadMore done old=%zu new=%zu hasMore=%d",
+                  old_size, items_.size(), hasMore_ ? 1 : 0);
+    appendGridRows(old_size);
+
+    if (statusLabel) {
+        statusLabel->setText(newpipe::tr("search/results_count", lastQuery_, items_.size()));
+    }
+    loadingMore_ = false;
 }
 
 bool SearchTab::allowInitialInput() const {

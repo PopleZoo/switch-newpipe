@@ -1,5 +1,53 @@
 # Handoff
 
+## 플레이어 재생 안정화 + 화질 선택 + 이어보기 (2026-08-10)
+
+로컬 빌드가 처음으로 가능해졌다: `C:\devtools\msys64`의 devkitPro
+(`/opt/devkitpro`)와 `cmake-build-switch`를 쓰는 네이티브 증분 빌드
+(`build_native.sh`, `cmake --build cmake-build-switch -j$(nproc) --target switch_newpipe.nro`).
+Docker 없이도 같은 경로로 빌드되어 Docker 산출물과 동일하다.
+
+- **크래시 원인 2건 수정** (실기 크래시가 `audio prefetch` 시작 직후에 멈췄던 이슈)
+  - `main()` 진입 직후 `curl_global_init(CURL_GLOBAL_ALL)` — libcurl을 아무도
+    초기화하지 않아 비디오/오디오 스레드가 lazy init을 경합하다 크래시했다.
+  - 오디오 prefetch 스레드를 `std::thread`(libnx 기본 16KB 스택)에서
+    `pthread_create` + 512KB 스택으로 교체. 생성 rc 검사와
+    `player: audio prefetch thread started` 등 단계 로그 추가.
+- **seek을 다운로더 재시작 방식으로 확장** (기존 "버퍼 끝에서 거절 + BUFFERED TO" 폐기)
+  - `stream_seek`가 버퍼 밖 offset을 만나면 `stream_seek_restart_` /
+    `audio_seek_restart_` 플래그 + 타깃을 기록하고 cv를 알린다.
+  - 영상 청크 루프와 오디오 prefetch 루프(UMP/ranged 양쪽)가 플래그를 소비해
+    `streamed_bytes_` / `audio_downloaded_bytes_`를 타깃으로 되돌리고 그 지점부터
+    재개한다. 반복 이동도 한 번씩 플래그를 다시 세우므로 반복이 가능하다.
+  - 멤버 8개 신규: `stream/audio_retained_edge_`, `_restart_base_`,
+    `_seek_restart_`, `_seek_restart_target_`. prepare/stop 리셋에도 포함.
+  - `seek_relative`의 버퍼 클램프 제거. 이제 항상 mpv에 절대 seek을 보낸다.
+  - 기존 doc들의 "seek_fn은 캐시 안에서만 성공" 설명은 전부 구식이다.
+- **화질 선택 (X 버튼)**
+  - `YouTubeResolver::resolve_with_height()` 추가. `ResolvedPlayback`에
+    `available_heights` 추가 (progressive mp4 / adaptive avc1 mp4 / HLS variant).
+    WebM/VP9 제외.
+  - 플레이어 `X` → 화질 메뉴(위/아래 선택, `A` 적용, `B/X/Y` 닫기). 적용 시
+    `switch_quality()`가 현재 위치를 보존하고 브리지/mpv를 재구성해 같은 위치부터
+    재생. 실패하면 이전 화질 복구, 복구 실패 시 플레이어 종료.
+  - `AUTO` = 휴대 720p / 독 모드(`AppletOperationMode_Console`) 1080p.
+  - 이제 `X`/`Y`는 각각 화질 메뉴 / OSD 고정이다 (기존엔 둘 다 OSD).
+- **이어보기 (Continue Watching)**
+  - `LibraryStore`에 `update_history_position()` / `history_position()` 추가.
+    `StreamItem`에 `position_seconds` / `duration_seconds` 추가.
+  - 플레이어가 10초마다 + 일시정지/종료 시 저장. 영상 재오픈 시
+    `PlaybackRequest::start_position_seconds`로 전달하고 파일 로드 후 그 위치로
+    seek (브리지 경로면 재시작 메커니즘이 그 지점부터 받는다).
+- **썸네일**: `stb_image` 구현 중복 링크 에러 해결 — `image_loader.cpp`의
+  `STB_IMAGE_IMPLEMENTATION` 제거, libborealis.a(nanovg.o)의 구현을 링크.
+  WebP/JPEG/PNG → PNG 변환은 그대로 동작.
+- 검증
+  - 네이티브 빌드 성공, `switch_newpipe.nro` FTP 배포 완료
+    (`/switch/switch_newpipe/switch_newpipe.nro`)
+  - **실기 검증 대기**: 크래시 수정(재생 시작), seek 재시작, 화질 전환, 이어보기,
+    2열 카드/썸네일. 체크 항목은 `docs/testing.md`
+  - 호스트 빌드/`make host`는 아직 이 세션에서 실행 안 함 (common 변경 있음)
+
 ## 좌우 seek 복구 (2026-07-29)
 
 roadmap Phase 2의 `좌우 seek 복구` 항목. `좌 / 우` 10초, `LB / RB` 60초다.
@@ -12,9 +60,10 @@ roadmap Phase 2의 `좌우 seek 복구` 항목. `좌 / 우` 10초, `LB / RB` 60�
 - `clen`이 있으면 `받은 바이트 / 총 바이트`를 시간으로 환산해 버퍼 끝 2초 앞까지만
   이동을 허용하고, 막히면 OSD에 `BUFFERED TO mm:ss`를 띄운다. 분리 오디오가 있으면
   video / audio 중 느린 쪽 비율을 쓴다.
-- `size_fn`은 일부러 null이다. byte offset 이동에 총 크기는 필요 없고, 크기를 주면
-  fragmented MP4에서 ffmpeg가 fragment index를 찾아 파일 끝으로 이동하려 한다.
-  부분만 받은 캐시 파일에서 못 주는 offset이 정확히 그 위치다.
+- `size_fn`은 총 크기를 알려준다. 크기를 모르면 fragmented MP4의 demuxer가 열기
+  전에 index 전체를 훑어 "전체 다운로드 후 재생"이 된다. 크기를 주면 열 때 파일
+  끝으로 한 번 이동하고(mfra / moov-at-end), 다운로더가 점프 지점에서 한 chunk를
+  받은 뒤 기존 frontier로 돌아와 순차 다운로드를 이어간다(갭은 순차로 채워진다).
 - OSD 진행 바에 버퍼 구간을 밝은 회색으로 같이 그린다. 이동 직후에는 mpv가 잠깐
   이전 `time-pos`를 돌려주므로 600ms 동안 OSD 시간을 요청 위치에 고정한다.
 - 검증

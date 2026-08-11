@@ -10,7 +10,7 @@
 #include "view/tab_focus.hpp"
 
 namespace {
-constexpr size_t kGridColumns = 4;
+constexpr size_t kGridColumns = 2;
 }
 
 LibraryTab::LibraryTab() : service_() {

@@ -28,6 +28,8 @@ json serialize_stream_item(const StreamItem& item) {
         {"view_count_text", item.view_count_text},
         {"published_text", item.published_text},
         {"is_live", item.is_live},
+        {"position_seconds", item.position_seconds},
+        {"duration_seconds", item.duration_seconds},
     };
 }
 
@@ -51,6 +53,8 @@ StreamItem deserialize_stream_item(const json& node) {
     item.view_count_text = get_string(node, "view_count_text");
     item.published_text = get_string(node, "published_text");
     item.is_live = node.value("is_live", false);
+    item.position_seconds = node.value("position_seconds", -1.0);
+    item.duration_seconds = node.value("duration_seconds", 0.0);
     return item;
 }
 
@@ -196,6 +200,54 @@ bool LibraryStore::add_history(const StreamItem& item, std::string* error_messag
 
     logf("library: add history url=%s", item.url.c_str());
     return this->persist(error_message);
+}
+
+bool LibraryStore::update_history_position(
+    const std::string& video_id,
+    double position_seconds,
+    double duration_seconds,
+    std::string* error_message) {
+    if (!this->ensure_loaded(error_message) || video_id.empty()) {
+        return false;
+    }
+
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        for (auto& item : this->history_items_) {
+            if (item.id == video_id) {
+                item.position_seconds = position_seconds;
+                item.duration_seconds = duration_seconds;
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if (!found) {
+        return true;
+    }
+    logf("library: update history position id=%s pos=%.1f dur=%.1f",
+         video_id.c_str(),
+         position_seconds,
+         duration_seconds);
+    return this->persist(error_message);
+}
+
+std::optional<std::pair<double, double>> LibraryStore::history_position(const std::string& video_id) const {
+    if (video_id.empty()) {
+        return std::nullopt;
+    }
+
+    std::string error;
+    const_cast<LibraryStore*>(this)->ensure_loaded(&error);
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    for (const auto& item : this->history_items_) {
+        if (item.id == video_id) {
+            return std::pair<double, double>(item.position_seconds, item.duration_seconds);
+        }
+    }
+    return std::nullopt;
 }
 
 bool LibraryStore::toggle_favorite(

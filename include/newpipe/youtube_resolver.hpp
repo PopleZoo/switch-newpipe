@@ -3,6 +3,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "newpipe/http_client.hpp"
 #include "newpipe/throttling_decrypter.hpp"
@@ -31,6 +32,7 @@ struct ResolvedPlayback {
     std::string fallback_external_audio_url;
     bool use_ump = false;
     bool is_live = false;
+    std::vector<int> available_heights;
 };
 
 using ResolverStatusCallback = std::function<void(const std::string&, const std::string&)>;
@@ -44,6 +46,12 @@ public:
         std::string& error_message,
         ResolverStatusCallback on_status = {});
 
+    std::optional<ResolvedPlayback> resolve_with_height(
+        const std::string& url,
+        int preferred_height,
+        std::string& error_message,
+        ResolverStatusCallback on_status = {});
+
     static bool is_youtube_url(const std::string& url);
     static std::optional<std::string> extract_video_id(const std::string& url);
 
@@ -53,6 +61,7 @@ public:
 private:
     std::optional<ResolvedPlayback> resolve_internal(
         const std::string& url,
+        int preferred_height,
         std::string& error_message,
         ResolverStatusCallback on_status);
 

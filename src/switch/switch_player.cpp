@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <mutex>
 #include <optional>
+#include <pthread.h>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -31,12 +32,21 @@
 #include <mpv/stream_cb.h>
 
 #include "newpipe/i18n.hpp"
+#include "newpipe/library_store.hpp"
 #include "newpipe/log.hpp"
 #include "newpipe/ump.hpp"
 #include "newpipe/youtube_resolver.hpp"
 
 namespace newpipe {
 namespace {
+
+// The portlibs TLS stack (mbedtls without MBEDTLS_THREADING_C) keeps its RNG /
+// entropy state in globals with no locking. Concurrent handshakes from the
+// video and audio download threads corrupt that state and crash both threads,
+// so every network perform in the download paths is serialized through this
+// mutex. Held only for the duration of one curl request; never taken from the
+// mpv stream callback, so no lock-order issue with stream_mutex_.
+std::mutex g_download_network_mutex;
 
 constexpr const char* kUserAgent =
     "Mozilla/5.0 (Nintendo Switch; Switch-NewPipe)";
@@ -47,7 +57,7 @@ constexpr const char* kUmpDownloadUserAgent =
     "(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
 constexpr const char* kProtocolPrefix = "switchcache://";
 constexpr float kPi = 3.14159265f;
-constexpr size_t kInitialStreamBufferBytes = 512 * 1024;
+constexpr size_t kInitialStreamBufferBytes = 1024 * 1024;
 constexpr double kShortSeekSeconds = 10.0;
 constexpr double kLongSeekSeconds = 60.0;
 
@@ -86,6 +96,14 @@ struct FileDownloadContext {
     int fd = -1;
     size_t offset = 0;
     std::atomic<size_t>* progress = nullptr;
+};
+
+struct AudioPrefetchCtx {
+    class SwitchPlayer* self = nullptr;
+    std::string url;
+    std::string referer;
+    std::string headers;
+    bool use_ump = false;
 };
 
 struct CurlByteBuffer {
@@ -533,22 +551,29 @@ private:
         info->cookie = stream;
         info->read_fn = &SwitchPlayer::stream_read;
         info->seek_fn = &SwitchPlayer::stream_seek;
-        // size_fn stays null on purpose. The demuxer does not need the total size
-        // to seek by byte offset, and with an unknown size ffmpeg cannot attempt
-        // SEEK_END. That matters for fragmented MP4: a seekable stream with a known
-        // size makes mov_read_mfra() jump to the end of the file for the fragment
-        // index, which for a partially downloaded cache file is the one offset we
-        // can never serve.
-        info->size_fn = nullptr;
+        // Report the real total size. With an unknown size ffmpeg's mov demuxer
+        // walks the entire fragment index before it can open a fragmented MP4,
+        // which on a slow stream means "downloads the whole file, then plays".
+        // With a known size it seeks to the end once (mfra check / moov-at-end)
+        // and our seek handler restarts the downloader at that offset, so the
+        // end region is fetched on demand and the file opens after a handful of
+        // chunks. The "partially downloaded cache" concern that motivated nulling
+        // size_fn is gone: any un-downloaded offset is served by restarting the
+        // downloader there instead of being rejected.
+        info->size_fn = &SwitchPlayer::stream_size;
         info->close_fn = &SwitchPlayer::stream_close;
         return 0;
     }
 
-    // Seeks are served straight out of the download cache file, so only bytes that
-    // already landed can be reached. Targets past the buffered edge are rejected
-    // instead of waited for: the downloader walks the stream strictly forward, so
-    // blocking on a far target would stall the demuxer for as long as the rest of
-    // the download takes.
+    // Seeks are served straight out of the download cache file. A target inside a
+    // buffered region (the initial prefix [0, retained_edge] or the active
+    // download region [restart_base, streamed_bytes]) is served directly. Any
+    // other target - a forward seek past the buffered edge, or a backward seek
+    // into a gap left by an earlier restart - cannot be served yet, so the
+    // downloader is restarted at that exact byte position instead of rejecting
+    // the seek. For fragmented MP4 the mov demuxer seeks to sidx-computed moof
+    // offsets, so the restart point is always a fragment boundary and playback
+    // resumes cleanly once the bytes arrive.
     static int64_t stream_seek(void* cookie, int64_t offset) {
         auto* stream = static_cast<StreamSession*>(cookie);
         if (!stream || !stream->player) {
@@ -562,18 +587,67 @@ private:
         const auto target = static_cast<uint64_t>(offset);
         if (stream->is_audio) {
             std::lock_guard<std::mutex> lock(player->audio_mutex_);
-            if (player->audio_cache_fd_ < 0 || target > player->audio_downloaded_bytes_.load()) {
+            if (player->audio_cache_fd_ < 0) {
                 return MPV_ERROR_UNSUPPORTED;
+            }
+            if (player->audio_download_done_.load()) {
+                // Fully downloaded: every byte is present (failures are rejected
+                // below); a seek past the end is served as EOF by stream_read.
+                if (!player->audio_download_success_.load()) {
+                    return MPV_ERROR_UNSUPPORTED;
+                }
+            } else {
+                const uint64_t downloaded = player->audio_downloaded_bytes_.load();
+                const bool covered = target <= player->audio_retained_edge_
+                    || (target >= player->audio_restart_base_ && target <= downloaded);
+                if (!covered) {
+                    if (!contains_case_insensitive(
+                            player->active_external_audio_url_, "googlevideo.com/videoplayback")) {
+                        return MPV_ERROR_UNSUPPORTED;
+                    }
+                    player->audio_seek_restart_ = true;
+                    player->audio_seek_restart_target_ = target;
+                    player->audio_cv_.notify_all();
+                }
             }
         } else {
             std::lock_guard<std::mutex> lock(player->stream_mutex_);
-            if (player->stream_cache_fd_ < 0 || target > player->streamed_bytes_) {
+            if (player->stream_cache_fd_ < 0) {
                 return MPV_ERROR_UNSUPPORTED;
+            }
+            if (player->stream_download_done_) {
+                if (!player->stream_download_success_) {
+                    return MPV_ERROR_UNSUPPORTED;
+                }
+            } else {
+                const bool covered = target <= player->stream_retained_edge_
+                    || (target >= player->stream_restart_base_ && target <= player->streamed_bytes_);
+                if (!covered) {
+                    if (!contains_case_insensitive(
+                            player->active_url_, "googlevideo.com/videoplayback")) {
+                        return MPV_ERROR_UNSUPPORTED;
+                    }
+                    player->stream_seek_restart_ = true;
+                    player->stream_seek_restart_target_ = target;
+                    player->stream_cv_.notify_all();
+                }
             }
         }
 
         stream->position = static_cast<size_t>(target);
         return offset;
+    }
+
+    static int64_t stream_size(void* cookie) {
+        auto* stream = static_cast<StreamSession*>(cookie);
+        if (!stream || !stream->player) {
+            return -1;
+        }
+        auto* player = stream->player;
+        const uint64_t total = stream->is_audio
+            ? player->audio_total_bytes_
+            : player->stream_total_bytes_;
+        return total > 0 ? static_cast<int64_t>(total) : -1;
     }
 
     static int64_t stream_read(void* cookie, char* buffer, uint64_t bytes) {
@@ -613,18 +687,36 @@ private:
         if (player->stream_cache_fd_ < 0) {
             return MPV_ERROR_GENERIC;
         }
-        while (stream->position >= player->streamed_bytes_ && !player->stream_download_done_) {
+        // Only two regions are guaranteed present: the prefix [0, retained_edge]
+        // and the active download region [restart_base, streamed_bytes). After a
+        // forward jump (SEEK_END for moov/mfra) the gap between them exists in
+        // neither, so wait for the downloader to resume and fill it instead of
+        // handing out whatever happens to be in the cache file there.
+        while (true) {
+            if (player->stream_download_done_) {
+                break;
+            }
+            const uint64_t position = stream->position;
+            const bool prefix_ok = position <= player->stream_retained_edge_;
+            const bool active_ok = position >= player->stream_restart_base_
+                && position < player->streamed_bytes_;
+            if (prefix_ok || active_ok) {
+                break;
+            }
             player->stream_cv_.wait_for(lock, std::chrono::milliseconds(100));
         }
 
-        const size_t available = player->streamed_bytes_ > stream->position
-            ? player->streamed_bytes_ - stream->position
-            : 0;
+        const uint64_t position = stream->position;
+        const uint64_t prefix_edge = player->stream_retained_edge_;
+        const uint64_t region_end = position <= prefix_edge
+            ? prefix_edge + 1
+            : player->streamed_bytes_;
         const bool failed = player->stream_download_done_ && !player->stream_download_success_;
-        if (available == 0) {
+        if (region_end <= position) {
             return failed ? MPV_ERROR_GENERIC : 0;
         }
 
+        const size_t available = static_cast<size_t>(region_end - position);
         const size_t to_read = std::min<size_t>(available, static_cast<size_t>(bytes));
         const size_t read = read_at_fd(player->stream_cache_fd_, buffer, to_read, stream->position);
         if (read == 0) {
@@ -806,8 +898,177 @@ private:
         force_redraw = true;
     }
 
+    int default_auto_height() const {
+#if defined(__SWITCH__)
+        if (appletGetOperationMode() == AppletOperationMode_Console) {
+            return 1080;
+        }
+#endif
+        return 720;
+    }
+
+    void open_quality_menu(bool& force_redraw) {
+        if (available_heights_.empty() || active_is_live_) {
+            show_osd_message(newpipe::tr("player/osd/quality_unavailable"), 2000);
+            return;
+        }
+        quality_menu_index_ = 0;
+        if (active_requested_height_ > 0) {
+            for (size_t i = 0; i < available_heights_.size(); i++) {
+                if (available_heights_[i] == active_requested_height_) {
+                    quality_menu_index_ = static_cast<int>(i) + 1;
+                    break;
+                }
+            }
+        }
+        quality_menu_open_ = true;
+        refresh_osd_snapshot(true);
+        force_redraw = true;
+        logf("player: quality menu open heights=%zu",
+             available_heights_.size());
+    }
+
+    void quality_menu_move(int delta) {
+        const int count = static_cast<int>(available_heights_.size()) + 1;
+        quality_menu_index_ = (quality_menu_index_ + delta + count) % count;
+    }
+
+    void select_quality(bool& force_redraw) {
+        quality_menu_open_ = false;
+        const int height =
+            quality_menu_index_ <= 0 || quality_menu_index_ > static_cast<int>(available_heights_.size())
+            ? 0
+            : available_heights_[quality_menu_index_ - 1];
+        if (height == active_requested_height_ || (height == 0 && active_requested_height_ == 0)) {
+            show_osd_message(newpipe::tr("player/osd/quality_unchanged"), 1500);
+            force_redraw = true;
+            return;
+        }
+        const int previous_height = active_requested_height_;
+        std::string switch_error;
+        if (!switch_quality(height, switch_error)) {
+            logf("player: quality switch failed error=%s", switch_error.c_str());
+            // Restore the previous quality so the player is not left streamless.
+            std::string restore_error;
+            if (switch_quality(previous_height, restore_error)) {
+                show_osd_message(
+                    newpipe::tr("player/osd/quality_switch_failed", clamp_text(switch_error, 36)),
+                    3000);
+                force_redraw = true;
+                return;
+            }
+            logf("player: quality restore failed error=%s", restore_error.c_str());
+            terminal_error_ = switch_error.empty() ? "quality switch failed" : switch_error;
+            exit_requested_ = true;
+        }
+        force_redraw = true;
+    }
+
+    void render_quality_menu(int width, int height) {
+        const int menu_scale = std::max(2, height / 300);
+        const int row_h = menu_scale * 9;
+        const int rows = static_cast<int>(available_heights_.size()) + 1;
+        const int panel_w = std::min(width / 2, 360);
+        const int panel_h = row_h * rows + menu_scale * 9 + 28;
+        const int panel_x = (width - panel_w) / 2;
+        const int panel_y = std::max(20, (height - panel_h) / 2);
+
+        fill_rect(panel_x, panel_y, panel_w, panel_h, height, 0.05f, 0.05f, 0.05f);
+        draw_text_line(
+            panel_x + 18, panel_y + 14, menu_scale, height, "QUALITY", 0.72f, 0.72f, 0.72f);
+        for (int row = 0; row < rows; row++) {
+            const bool selected = row == quality_menu_index_;
+            std::string label = row == 0
+                ? newpipe::tr("player/quality/auto")
+                : std::to_string(available_heights_[row - 1]) + "P";
+            const int item_y = panel_y + 14 + menu_scale * 9 + row * row_h;
+            if (selected) {
+                fill_rect(panel_x + 8, item_y - 4, panel_w - 16, row_h - 4, height, 0.24f, 0.24f, 0.24f);
+            }
+            const bool is_current =
+                (row == 0 && active_requested_height_ == 0)
+                || (row > 0 && active_requested_height_ > 0
+                    && available_heights_[row - 1] == active_requested_height_);
+            if (is_current) {
+                label += "*";
+            }
+            draw_text_line(
+                panel_x + 18,
+                item_y,
+                menu_scale,
+                height,
+                label,
+                selected ? 1.0f : 0.75f,
+                selected ? 1.0f : 0.75f,
+                selected ? 1.0f : 0.75f);
+        }
+    }
+
+    void checkpoint_position() {
+        if (active_is_live_ || request_.video_id.empty() || !first_frame_rendered_.load()
+            || last_duration_ <= 0.0) {
+            position_checkpoint_queued_ = false;
+            return;
+        }
+        std::string ignored_error;
+        if (!newpipe::LibraryStore::instance().update_history_position(
+                request_.video_id,
+                last_time_pos_,
+                last_duration_,
+                &ignored_error)) {
+            logf("player: position checkpoint write failed error=%s", ignored_error.c_str());
+        } else {
+            logf("player: position checkpoint pos=%.1fs dur=%.1fs", last_time_pos_, last_duration_);
+        }
+        position_checkpoint_queued_ = false;
+    }
+
+    void maybe_checkpoint_position() {
+        if (active_is_live_ || request_.video_id.empty() || !first_frame_rendered_.load()) {
+            return;
+        }
+        if (position_checkpoint_at_.time_since_epoch().count() == 0) {
+            position_checkpoint_at_ = std::chrono::steady_clock::now();
+            return;
+        }
+        if (!position_checkpoint_queued_
+            && std::chrono::steady_clock::now() - position_checkpoint_at_
+                >= std::chrono::seconds(10)) {
+            position_checkpoint_queued_ = true;
+            checkpoint_position();
+            position_checkpoint_at_ = std::chrono::steady_clock::now();
+        }
+    }
+
+    void maybe_apply_resume_seek() {
+        double target = pending_resume_position_;
+        if (target <= 1.0) {
+            target = request_.start_position_seconds;
+        }
+        if (start_seek_applied_ || target <= 1.0 || !mpv_ || active_is_live_) {
+            return;
+        }
+        start_seek_applied_ = true;
+        char target_text[32];
+        std::snprintf(target_text, sizeof(target_text), "%.3f", target);
+        const char* command[] = {"seek", target_text, "absolute", nullptr};
+        logf("player: resume seek to %.3fs", target);
+        if (mpv_command_async(mpv_, 0, command) < 0) {
+            log_line("player: resume seek failed");
+            return;
+        }
+        last_time_pos_ = target;
+        pending_resume_position_ = 0.0;
+        osd_time_hold_until_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(600);
+        show_osd_message(newpipe::tr("player/osd/resumed", format_playback_time(target)), 2500);
+    }
+
     void render_playback_osd(int width, int height) {
         refresh_osd_snapshot();
+        if (quality_menu_open_) {
+            render_quality_menu(width, height);
+            return;
+        }
         if (!should_draw_osd()) {
             return;
         }
@@ -931,7 +1192,7 @@ private:
             0.72f);
     }
 
-    bool prepare_stream(std::string& error) {
+    bool prepare_stream(std::string& error, int preferred_height = 0) {
         use_stream_bridge_ = false;
         active_local_media_path_.clear();
         active_external_audio_local_path_.clear();
@@ -959,6 +1220,7 @@ private:
         fallback_attempted_ = false;
         active_use_ump_ = false;
         active_is_live_ = false;
+        available_heights_.clear();
 
         if (!YouTubeResolver::is_youtube_url(request_.url)) {
             set_loading_status(
@@ -968,12 +1230,20 @@ private:
         }
 
         YouTubeResolver resolver;
-        const auto resolved = resolver.resolve(
-            request_.url,
-            error,
-            [this](const std::string& title, const std::string& detail) {
-                set_loading_status(translate_loading_text(title), translate_loading_text(detail));
-            });
+        const auto resolved = preferred_height > 0
+            ? resolver.resolve_with_height(
+                  request_.url,
+                  preferred_height,
+                  error,
+                  [this](const std::string& title, const std::string& detail) {
+                      set_loading_status(translate_loading_text(title), translate_loading_text(detail));
+                  })
+            : resolver.resolve(
+                  request_.url,
+                  error,
+                  [this](const std::string& title, const std::string& detail) {
+                      set_loading_status(translate_loading_text(title), translate_loading_text(detail));
+                  });
         if (!resolved.has_value()) {
             return false;
         }
@@ -991,6 +1261,7 @@ private:
         fallback_external_audio_url_ = resolved->fallback_external_audio_url;
         active_use_ump_ = resolved->use_ump;
         active_is_live_ = resolved->is_live;
+        available_heights_ = resolved->available_heights;
         if (!resolved->playlist_body.empty()) {
 #ifdef __SWITCH__
             active_local_media_path_ = "sdmc:/switch/switch_newpipe_selected.m3u8";
@@ -1063,6 +1334,10 @@ private:
             stream_download_done_ = false;
             stream_download_success_ = false;
             stream_download_error_.clear();
+            stream_seek_restart_ = false;
+            stream_seek_restart_target_ = 0;
+            stream_retained_edge_ = 0;
+            stream_restart_base_ = 0;
         }
         stream_total_bytes_ = 0;
 
@@ -1166,9 +1441,11 @@ private:
 
     bool perform_chunked_ranged_download(CURL* parent_curl, long& status_code) {
         (void)parent_curl;
-        // 1 MiB keeps every request comfortably inside YouTube's un-throttled
-        // initial burst window while halving the request count vs 512 KiB.
-        constexpr uint64_t kChunkBytes = 1024 * 1024;
+        // 4 MiB chunks trade a little throttle headroom for far fewer round trips.
+        // The UMP/range dance costs a full request per chunk and the video and
+        // audio downloads share g_download_network_mutex, so 1 MiB chunks made
+        // the frontier crawl (~1 MB/s) and playback never beat the load timeout.
+        constexpr uint64_t kChunkBytes = 4 * 1024 * 1024;
         constexpr int kMaxRetries = 5;
         const auto total_size = find_query_u64(active_url_, "clen");
         if (!total_size.has_value() || *total_size == 0) {
@@ -1212,10 +1489,71 @@ private:
 
         bool completed = false;
         int rn = 0;
+        // Video pacing: turn the advertised size and duration into bytes-per-second,
+        // then keep the download only kPacingBufferSeconds of media ahead of the
+        // playhead instead of pulling the whole file. A seek restart (gap fill)
+        // or an abort always breaks the pacing hold immediately.
+        const double bytes_per_second = last_duration_ > 0.0
+            ? static_cast<double>(*total_size) / last_duration_
+            : 0.0;
+        constexpr double kPacingBufferSeconds = 25.0;
+        constexpr uint64_t kPacingBufferMinBytes = 4 * 1024 * 1024;
         while (!stream_abort_.load()) {
             size_t chunk_start = 0;
             {
                 std::lock_guard<std::mutex> lock(stream_mutex_);
+                if (stream_seek_restart_) {
+                    stream_seek_restart_ = false;
+                    const uint64_t restart_target = stream_seek_restart_target_;
+                    const uint64_t old_frontier = streamed_bytes_;
+                    if (restart_target >= *total_size) {
+                        // Seek at or past EOF: nothing to fetch, reads report EOF.
+                        logf("player: stream download seek at EOF target=%llu total=%llu",
+                             static_cast<unsigned long long>(restart_target),
+                             static_cast<unsigned long long>(*total_size));
+                    } else if (restart_target > old_frontier) {
+                        // Forward seek past the buffered edge. Save the frontier
+                        // and jump the downloader to the requested byte - e.g.
+                        // the demuxer's SEEK_END for moov/mfra once size_fn
+                        // reports a real size. One chunk is fetched at the jump
+                        // point (the tail), then the download resumes from the
+                        // saved frontier so the gap in between is filled into
+                        // the cache before playback ever needs it. Everything
+                        // below the old frontier stays valid, so the prefix
+                        // keeps being served directly.
+                        stream_jump_frontier_ = old_frontier;
+                        stream_jump_target_ = restart_target;
+                        stream_jump_pending_ = true;
+                        streamed_bytes_ = restart_target;
+                        stream_restart_base_ = restart_target;
+                        if (old_frontier > stream_retained_edge_) {
+                            stream_retained_edge_ = old_frontier;
+                        }
+                        logf("player: stream download jump to=%llu resume=%llu retained_edge=%llu",
+                             static_cast<unsigned long long>(restart_target),
+                             static_cast<unsigned long long>(old_frontier),
+                             static_cast<unsigned long long>(stream_retained_edge_));
+                    } else {
+                        // Backward restart (gap fill): re-download the skipped
+                        // range like before.
+                        streamed_bytes_ = restart_target;
+                        stream_restart_base_ = restart_target;
+                        if (restart_target < stream_retained_edge_) {
+                            stream_retained_edge_ = restart_target;
+                        }
+                        if (stream_jump_pending_) {
+                            // A backward seek beat a pending tail jump. The old
+                            // frontier and everything below it is a valid prefix.
+                            stream_jump_pending_ = false;
+                            if (stream_jump_frontier_ > stream_retained_edge_) {
+                                stream_retained_edge_ = stream_jump_frontier_;
+                            }
+                        }
+                        logf("player: stream download restart at=%llu retained_edge=%llu",
+                             static_cast<unsigned long long>(restart_target),
+                             static_cast<unsigned long long>(stream_retained_edge_));
+                    }
+                }
                 chunk_start = streamed_bytes_;
             }
 
@@ -1225,11 +1563,57 @@ private:
                 break;
             }
 
+            // Hold the download while the buffered window ahead of the playhead is
+            // full. Decide inside the loop so a restart or exit is still handled
+            // promptly, and re-read the frontier under the lock each wake-up.
+            if (bytes_per_second > 0.0) {
+                const uint64_t buffer_target = std::max<uint64_t>(
+                    static_cast<uint64_t>(kPacingBufferSeconds * bytes_per_second),
+                    kPacingBufferMinBytes);
+                bool hold_logged = false;
+                while (!stream_abort_.load()) {
+                    uint64_t frontier = 0;
+                    bool restart_pending = false;
+                    bool jump_pending = false;
+                    {
+                        std::lock_guard<std::mutex> lock(stream_mutex_);
+                        frontier = streamed_bytes_;
+                        restart_pending = stream_seek_restart_;
+                        jump_pending = stream_jump_pending_;
+                    }
+                    if (restart_pending || jump_pending) {
+                        break;
+                    }
+                    const uint64_t playhead_bytes =
+                        static_cast<uint64_t>(last_time_pos_ * bytes_per_second);
+                    const uint64_t buffered_ahead = frontier > playhead_bytes
+                        ? frontier - playhead_bytes
+                        : 0;
+                    if (buffered_ahead < buffer_target) {
+                        break;
+                    }
+                    if (!hold_logged) {
+                        hold_logged = true;
+                        logf("player: pacing hold frontier=%llu playhead=%llu target=%llu",
+                             static_cast<unsigned long long>(frontier),
+                             static_cast<unsigned long long>(playhead_bytes),
+                             static_cast<unsigned long long>(buffer_target));
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                if (stream_abort_.load()) {
+                    break;
+                }
+            }
+
             const uint64_t chunk_end = std::min<uint64_t>(
                 *total_size - 1, static_cast<uint64_t>(chunk_start) + kChunkBytes - 1);
             const std::string range = std::to_string(chunk_start) + "-" + std::to_string(chunk_end);
             const std::string chunk_url = build_ranged_url(active_url_, range, rn);
             update_download_progress(static_cast<curl_off_t>(*total_size), static_cast<curl_off_t>(chunk_start));
+            logf("player: video chunk start=%zu end=%llu",
+                 chunk_start,
+                 static_cast<unsigned long long>(chunk_end));
 
             bool chunk_ok = false;
             for (int retry = 0; retry < kMaxRetries && !stream_abort_.load(); ++retry) {
@@ -1239,29 +1623,32 @@ private:
                 }
 
                 CURLcode result = CURLE_OK;
-                if (active_use_ump_) {
-                    std::vector<uint8_t> media_data;
-                    if (perform_ump_request(
-                            ch,
-                            active_url_,
-                            chunk_start,
-                            chunk_end,
-                            rn,
-                            media_data,
-                            status_code)
-                        && on_stream_write(media_data.data(), 1, media_data.size(), this)
-                            == media_data.size()) {
-                        chunk_ok = true;
-                        break;
-                    }
-                    result = CURLE_HTTP_RETURNED_ERROR;
-                } else {
-                    curl_easy_setopt(ch, CURLOPT_URL, chunk_url.c_str());
-                    result = curl_easy_perform(ch);
-                    curl_easy_getinfo(ch, CURLINFO_RESPONSE_CODE, &status_code);
-                    if (result == CURLE_OK && (status_code == 206 || status_code == 200)) {
-                        chunk_ok = true;
-                        break;
+                {
+                    std::lock_guard<std::mutex> net_lock(g_download_network_mutex);
+                    if (active_use_ump_) {
+                        std::vector<uint8_t> media_data;
+                        if (perform_ump_request(
+                                ch,
+                                active_url_,
+                                chunk_start,
+                                chunk_end,
+                                rn,
+                                media_data,
+                                status_code)
+                            && on_stream_write(media_data.data(), 1, media_data.size(), this)
+                                == media_data.size()) {
+                            chunk_ok = true;
+                            break;
+                        }
+                        result = CURLE_HTTP_RETURNED_ERROR;
+                    } else {
+                        curl_easy_setopt(ch, CURLOPT_URL, chunk_url.c_str());
+                        result = curl_easy_perform(ch);
+                        curl_easy_getinfo(ch, CURLINFO_RESPONSE_CODE, &status_code);
+                        if (result == CURLE_OK && (status_code == 206 || status_code == 200)) {
+                            chunk_ok = true;
+                            break;
+                        }
                     }
                 }
                 logf("player: ranged chunk failed range=%s curl=%d status=%ld attempt=%d",
@@ -1278,12 +1665,36 @@ private:
             size_t chunk_written = 0;
             {
                 std::lock_guard<std::mutex> lock(stream_mutex_);
-                chunk_written = streamed_bytes_ - chunk_start;
+                // A restart (e.g. another demuxer jump) may have landed mid-fetch
+                // and moved the frontier; only count bytes that actually advanced
+                // this range, otherwise the subtraction would underflow.
+                chunk_written = streamed_bytes_ > chunk_start
+                    ? streamed_bytes_ - chunk_start
+                    : 0;
             }
             if (chunk_written == 0) {
                 logf("player: ranged chunk empty range=%s", range.c_str());
                 break;
             }
+            {
+                std::lock_guard<std::mutex> lock(stream_mutex_);
+                if (stream_jump_pending_ && stream_jump_target_ == chunk_start) {
+                    // The tail chunk the demuxer jumped to has landed. Resume the
+                    // sequential download from the saved frontier so the gap
+                    // between the old edge and the tail fills up normally.
+                    stream_jump_pending_ = false;
+                    streamed_bytes_ = stream_jump_frontier_;
+                    stream_restart_base_ = stream_jump_frontier_;
+                    if (stream_jump_frontier_ > stream_retained_edge_) {
+                        stream_retained_edge_ = stream_jump_frontier_;
+                    }
+                    logf("player: stream download resumed at=%llu retained_edge=%llu",
+                         static_cast<unsigned long long>(streamed_bytes_),
+                         static_cast<unsigned long long>(stream_retained_edge_));
+                    log_line("player: video chunk ok (jump tail)");
+                }
+            }
+            logf("player: video chunk ok range=%s", range.c_str());
             ++rn;
         }
 
@@ -1316,12 +1727,18 @@ private:
             stream_download_done_ = false;
             stream_download_success_ = false;
             stream_download_error_.clear();
+            stream_seek_restart_ = false;
+            stream_seek_restart_target_ = 0;
+            stream_retained_edge_ = 0;
+            stream_restart_base_ = 0;
         }
 
         stream_total_bytes_ = find_query_u64(active_url_, "clen").value_or(0);
         stream_abort_.store(false);
         last_progress_update_ = std::chrono::steady_clock::time_point{};
         stream_download_thread_ = std::thread([this]() {
+            newpipe::set_thread_tag("video-download");
+            log_line("player: video download thread entered");
             CURL* curl = curl_easy_init();
             if (!curl) {
                 std::lock_guard<std::mutex> lock(stream_mutex_);
@@ -1363,18 +1780,24 @@ private:
             }
             long status_code = 0;
             CURLcode result = CURLE_OK;
-            const bool has_ratebypass = contains_case_insensitive(active_url_, "ratebypass=yes");
-            if (is_googlevideo && !has_ratebypass) {
+            // Every googlevideo stream with a known size goes through the chunked
+            // ranged downloader, including ratebypass=yes fallback URLs. A single
+            // curl_easy_perform() call downloads the WHOLE file before file-loaded
+            // fires (progressive MP4s need the moov at the end); ranged chunks keep
+            // playback starting after the first few megabytes and let the demuxer
+            // SEEK_END for the moov, which the restart handler serves on demand.
+            if (contains_case_insensitive(active_url_, "googlevideo.com/videoplayback")
+                && find_query_u64(active_url_, "clen").has_value()) {
                 log_line(active_use_ump_
                     ? "player: using tokenless Android VR UMP ranged download"
                     : "player: using chunked ranged download");
                 const bool ok = perform_chunked_ranged_download(curl, status_code);
                 result = ok ? CURLE_OK : CURLE_HTTP_RETURNED_ERROR;
             } else {
-                if (has_ratebypass) {
-                    log_line("player: using direct download (ratebypass)");
+                {
+                    std::lock_guard<std::mutex> net_lock(g_download_network_mutex);
+                    result = curl_easy_perform(curl);
                 }
-                result = curl_easy_perform(curl);
                 curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
             }
             curl_slist_free_all(header_list);
@@ -1501,7 +1924,10 @@ private:
                             std::this_thread::sleep_for(std::chrono::milliseconds(500 * retry));
                             curl_easy_setopt(curl, CURLOPT_URL, chunk_url.c_str());
                         }
-                        result = curl_easy_perform(curl);
+                        {
+                            std::lock_guard<std::mutex> net_lock(g_download_network_mutex);
+                            result = curl_easy_perform(curl);
+                        }
                         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
                         if (result == CURLE_OK && (status_code == 206 || status_code == 200)) {
                             chunk_ok = true;
@@ -1527,7 +1953,10 @@ private:
                 }
             }
         } else {
-            result = curl_easy_perform(curl);
+            {
+                std::lock_guard<std::mutex> net_lock(g_download_network_mutex);
+                result = curl_easy_perform(curl);
+            }
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
         }
 
@@ -1585,21 +2014,50 @@ private:
             : 0;
         pending_external_audio_attach_ = true;
         logf("player: start audio prefetch kind=split-audio url=%s", source_url.c_str());
-        audio_download_thread_ = std::thread([this, source_url, source_referer, source_headers, source_use_ump]() {
-            CURL* curl = curl_easy_init();
-            if (!curl) {
-                audio_download_success_.store(false);
-                audio_download_error_ = "audio curl init failed";
-                audio_download_done_.store(true);
-                audio_cv_.notify_all();
-                return;
-            }
+        auto* ctx = new AudioPrefetchCtx();
+        ctx->self = this;
+        ctx->url = source_url;
+        ctx->referer = source_referer;
+        ctx->headers = source_headers;
+        ctx->use_ump = source_use_ump;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 512 * 1024);
+        const int thread_rc = pthread_create(&audio_download_thread_, &attr, &SwitchPlayer::audio_prefetch_entry, ctx);
+        pthread_attr_destroy(&attr);
+        if (thread_rc != 0) {
+            delete ctx;
+            audio_download_success_.store(false);
+            audio_download_error_ = "audio thread creation failed";
+            audio_download_done_.store(true);
+            audio_cv_.notify_all();
+            logf("player: audio thread creation failed rc=%d", thread_rc);
+            return;
+        }
+        audio_thread_running_ = true;
+    }
+
+    void audio_prefetch_worker(
+        const std::string& source_url,
+        const std::string& source_referer,
+        const std::string& source_headers,
+        bool source_use_ump) {
+        logf("player: audio prefetch thread started");
+        CURL* curl = curl_easy_init();
+        if (!curl) {
+            audio_download_success_.store(false);
+            audio_download_error_ = "audio curl init failed";
+            audio_download_done_.store(true);
+            audio_cv_.notify_all();
+            return;
+        }
 
             struct curl_slist* header_list = nullptr;
             const auto extra_headers = split_header_fields(source_headers);
             for (const auto& header : extra_headers) {
                 header_list = curl_slist_append(header_list, header.c_str());
             }
+            logf("player: audio curl init ok extra_headers=%zu", extra_headers.size());
 
             const bool is_googlevideo_audio = contains_case_insensitive(source_url, "googlevideo.com/videoplayback");
             const char* audio_ua = is_googlevideo_audio
@@ -1629,6 +2087,7 @@ private:
             CURLcode result = CURLE_OK;
             if (contains_case_insensitive(source_url, "googlevideo.com/videoplayback") && source_use_ump) {
                 const auto total_size = find_query_u64(source_url, "clen");
+                logf("player: audio UMP path total_size=%llu", static_cast<unsigned long long>(total_size.value_or(0)));
                 if (!total_size.has_value() || *total_size == 0) {
                     result = CURLE_HTTP_RETURNED_ERROR;
                     audio_download_error_ = "audio UMP download missing clen";
@@ -1637,6 +2096,23 @@ private:
                     constexpr int kMaxRetries = 5;
                     int rn = 0;
                     while (!audio_download_abort_.load()) {
+                        {
+                            std::lock_guard<std::mutex> lock(audio_mutex_);
+                            if (audio_seek_restart_) {
+                                audio_seek_restart_ = false;
+                                const uint64_t restart_target = audio_seek_restart_target_;
+                                if (restart_target < audio_downloaded_bytes_.load()) {
+                                    audio_downloaded_bytes_.store(restart_target);
+                                }
+                                audio_restart_base_ = restart_target;
+                                if (restart_target < audio_retained_edge_) {
+                                    audio_retained_edge_ = restart_target;
+                                }
+                                logf("player: audio download restart at=%llu retained_edge=%llu",
+                                     static_cast<unsigned long long>(restart_target),
+                                     static_cast<unsigned long long>(audio_retained_edge_));
+                            }
+                        }
                         const size_t chunk_start = audio_downloaded_bytes_.load();
                         if (chunk_start >= *total_size) {
                             status_code = 200;
@@ -1645,25 +2121,31 @@ private:
                         const uint64_t chunk_end = std::min<uint64_t>(
                             *total_size - 1,
                             static_cast<uint64_t>(chunk_start) + kChunkBytes - 1);
+                        logf("player: audio UMP chunk start=%zu end=%llu",
+                             chunk_start,
+                             static_cast<unsigned long long>(chunk_end));
                         bool chunk_ok = false;
                         for (int retry = 0; retry < kMaxRetries && !audio_download_abort_.load(); ++retry) {
                             if (retry > 0) {
                                 std::this_thread::sleep_for(std::chrono::milliseconds(750 * retry));
                             }
                             std::vector<uint8_t> media_data;
-                            if (perform_ump_request(
-                                    curl,
-                                    source_url,
-                                    chunk_start,
-                                    chunk_end,
-                                    rn,
-                                    media_data,
-                                    status_code)
-                                && on_audio_stream_write(media_data.data(), 1, media_data.size(), this)
-                                    == media_data.size()) {
-                                chunk_ok = true;
-                                result = CURLE_OK;
-                                break;
+                            {
+                                std::lock_guard<std::mutex> net_lock(g_download_network_mutex);
+                                if (perform_ump_request(
+                                        curl,
+                                        source_url,
+                                        chunk_start,
+                                        chunk_end,
+                                        rn,
+                                        media_data,
+                                        status_code)
+                                    && on_audio_stream_write(media_data.data(), 1, media_data.size(), this)
+                                        == media_data.size()) {
+                                    chunk_ok = true;
+                                    result = CURLE_OK;
+                                    break;
+                                }
                             }
                             result = CURLE_HTTP_RETURNED_ERROR;
                         }
@@ -1671,6 +2153,7 @@ private:
                             audio_download_error_ = "audio UMP ranged chunk failed";
                             break;
                         }
+                        logf("player: audio UMP chunk ok bytes=%zu", audio_downloaded_bytes_.load());
                         ++rn;
                     }
                 }
@@ -1687,6 +2170,7 @@ private:
                 header_list = nullptr;
 
                 const auto total_size = find_query_u64(source_url, "clen");
+                logf("player: audio ranged path total_size=%llu", static_cast<unsigned long long>(total_size.value_or(0)));
                 if (!total_size.has_value() || *total_size == 0) {
                     result = CURLE_HTTP_RETURNED_ERROR;
                     audio_download_error_ = "audio ranged download missing clen";
@@ -1695,6 +2179,23 @@ private:
                     constexpr int kMaxRetries = 5;
                     int rn = 0;
                     while (!audio_download_abort_.load()) {
+                        {
+                            std::lock_guard<std::mutex> lock(audio_mutex_);
+                            if (audio_seek_restart_) {
+                                audio_seek_restart_ = false;
+                                const uint64_t restart_target = audio_seek_restart_target_;
+                                if (restart_target < audio_downloaded_bytes_.load()) {
+                                    audio_downloaded_bytes_.store(restart_target);
+                                }
+                                audio_restart_base_ = restart_target;
+                                if (restart_target < audio_retained_edge_) {
+                                    audio_retained_edge_ = restart_target;
+                                }
+                                logf("player: audio download restart at=%llu retained_edge=%llu",
+                                     static_cast<unsigned long long>(restart_target),
+                                     static_cast<unsigned long long>(audio_retained_edge_));
+                            }
+                        }
                         const size_t chunk_start = audio_downloaded_bytes_.load();
                         if (chunk_start >= *total_size) {
                             status_code = 206;
@@ -1703,6 +2204,9 @@ private:
 
                         const uint64_t chunk_end = std::min<uint64_t>(
                             *total_size - 1, static_cast<uint64_t>(chunk_start) + kChunkBytes - 1);
+                        logf("player: audio ranged chunk start=%zu end=%llu",
+                             chunk_start,
+                             static_cast<unsigned long long>(chunk_end));
                         const std::string range = std::to_string(chunk_start) + "-" + std::to_string(chunk_end);
                         const std::string chunk_url = build_ranged_url(source_url, range, rn);
 
@@ -1736,7 +2240,10 @@ private:
                                 curl_easy_setopt(ch, CURLOPT_REFERER, source_referer.c_str());
                             }
 
-                            result = curl_easy_perform(ch);
+                            {
+                                std::lock_guard<std::mutex> net_lock(g_download_network_mutex);
+                                result = curl_easy_perform(ch);
+                            }
                             curl_easy_getinfo(ch, CURLINFO_RESPONSE_CODE, &status_code);
                             curl_slist_free_all(ch_headers);
                             curl_easy_cleanup(ch);
@@ -1765,7 +2272,10 @@ private:
                     }
                 }
             } else {
-                result = curl_easy_perform(curl);
+                {
+                    std::lock_guard<std::mutex> net_lock(g_download_network_mutex);
+                    result = curl_easy_perform(curl);
+                }
                 curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
                 curl_slist_free_all(header_list);
                 curl_easy_cleanup(curl);
@@ -1791,13 +2301,13 @@ private:
                      static_cast<int>(result),
                      status_code);
             }
-        });
     }
 
     void stop_audio_prefetch() {
         audio_download_abort_.store(true);
-        if (audio_download_thread_.joinable()) {
-            audio_download_thread_.join();
+        if (audio_thread_running_) {
+            pthread_join(audio_download_thread_, nullptr);
+            audio_thread_running_ = false;
         }
         {
             std::lock_guard<std::mutex> lock(audio_mutex_);
@@ -1812,6 +2322,10 @@ private:
         audio_downloaded_bytes_.store(0);
         audio_total_bytes_ = 0;
         audio_prefetch_min_bytes_ = 0;
+        audio_seek_restart_ = false;
+        audio_seek_restart_target_ = 0;
+        audio_retained_edge_ = 0;
+        audio_restart_base_ = 0;
         audio_attach_attempted_ = false;
         audio_wait_logged_ = false;
         audio_download_error_.clear();
@@ -1827,8 +2341,9 @@ private:
         prepare_success_.store(false);
 
         prepare_thread_ = std::thread([this]() {
+            newpipe::set_thread_tag("prepare");
             std::string error;
-            const bool ok = prepare_stream(error);
+            const bool ok = prepare_stream(error, active_requested_height_);
             if (!ok) {
                 prepare_error_ = std::move(error);
             }
@@ -1914,53 +2429,60 @@ private:
 
     bool init_mpv(std::string& error) {
         std::setlocale(LC_NUMERIC, "C");
+        logf("player: init_mpv begin");
+        logf("player: setlocale done");
         mpv_ = mpv_create();
+        logf("player: mpv_create done");
         if (!mpv_) {
             error = "mpv_create failed";
             return false;
         }
 
-        mpv_set_option_string(mpv_, "vo", "libmpv");
-        mpv_set_option_string(mpv_, "hwdec", "auto-safe");
-        mpv_set_option_string(mpv_, "profile", "sw-fast");
-        mpv_set_option_string(mpv_, "osc", "no");
-        mpv_set_option_string(mpv_, "terminal", "no");
-        mpv_set_option_string(mpv_, "config", "no");
-        mpv_set_option_string(mpv_, "keep-open", "yes");
-        mpv_set_option_string(mpv_, "force-seekable", "no");
-        mpv_set_option_string(mpv_, "ytdl", "no");
-        mpv_set_option_string(mpv_, "tls-verify", "no");
-        mpv_set_option_string(mpv_, "access-references", "yes");
+        auto set_opt = [this](const char* name, const char* value) {
+            logf("player: mpv option name=%s", name);
+            mpv_set_option_string(mpv_, name, value);
+        };
+
+        set_opt("vo", "libmpv");
+        set_opt("hwdec", "auto-safe");
+        set_opt("profile", "sw-fast");
+        set_opt("osc", "no");
+        set_opt("terminal", "no");
+        set_opt("config", "no");
+        set_opt("keep-open", "yes");
+        set_opt("force-seekable", "no");
+        set_opt("ytdl", "no");
+        set_opt("tls-verify", "no");
+        set_opt("access-references", "yes");
         if (!active_local_media_path_.empty()) {
-            mpv_set_option_string(mpv_, "load-unsafe-playlists", "yes");
-            mpv_set_option_string(
-                mpv_, "demuxer-lavf-o", "protocol_whitelist=file,http,https,tcp,tls,crypto,data,subfile");
+            set_opt("load-unsafe-playlists", "yes");
+            set_opt("demuxer-lavf-o",
+                "protocol_whitelist=file,http,https,tcp,tls,crypto,data,subfile");
         }
         const bool is_hls = contains_case_insensitive(active_quality_label_, "hls");
         if (is_hls) {
             const std::string hls_bitrate = active_hls_bitrate_ > 0
                 ? std::to_string(active_hls_bitrate_)
                 : std::string("max");
-            mpv_set_option_string(mpv_, "hls-bitrate", hls_bitrate.c_str());
-            mpv_set_option_string(mpv_, "load-unsafe-playlists", "yes");
-            mpv_set_option_string(
-                mpv_, "demuxer-lavf-o",
+            set_opt("hls-bitrate", hls_bitrate.c_str());
+            set_opt("load-unsafe-playlists", "yes");
+            set_opt("demuxer-lavf-o",
                 "protocol_whitelist=file,http,https,tcp,tls,crypto,data,subfile");
         }
         if (use_stream_bridge_) {
-            mpv_set_option_string(
-                mpv_, "demuxer-lavf-o", "protocol_whitelist=file,http,https,tcp,tls,crypto,data,switchcache");
+            set_opt("demuxer-lavf-o",
+                "protocol_whitelist=file,http,https,tcp,tls,crypto,data,switchcache");
         }
         // Use Android UA for YouTube CDN to avoid rejection
         const bool is_youtube_stream = contains_case_insensitive(active_url_, "googlevideo.com")
             || contains_case_insensitive(active_url_, "youtube.com");
-        mpv_set_option_string(mpv_, "user-agent",
+        set_opt("user-agent",
             is_youtube_stream ? kDownloadUserAgent : kUserAgent);
         if (!active_referer_.empty()) {
-            mpv_set_option_string(mpv_, "referrer", active_referer_.c_str());
+            set_opt("referrer", active_referer_.c_str());
         }
         if (!active_http_header_fields_.empty()) {
-            mpv_set_option_string(mpv_, "http-header-fields", active_http_header_fields_.c_str());
+            set_opt("http-header-fields", active_http_header_fields_.c_str());
         }
 
         if (use_stream_bridge_ && mpv_stream_cb_add_ro(mpv_, "switchcache", this, &SwitchPlayer::stream_open) < 0) {
@@ -1968,10 +2490,18 @@ private:
             return false;
         }
 
+        // Disable ALL font/OSD/subtitle rendering in mpv to avoid harfbuzz crashes
+        set_opt("sub-font-provider", "none");
+        set_opt("osd-font-provider", "none");
+        set_opt("sub", "no");
+        set_opt("osd-level", "0");
+
+        logf("player: mpv_initialize begin");
         if (mpv_initialize(mpv_) < 0) {
             error = "mpv_initialize failed";
             return false;
         }
+        logf("player: mpv_initialize done");
 
         mpv_request_log_messages(mpv_, "warn");
         mpv_set_wakeup_callback(mpv_, &SwitchPlayer::on_mpv_wakeup, this);
@@ -2130,11 +2660,112 @@ private:
         return true;
     }
 
+    // Re-resolve at another height and restart playback at the current position.
+    // Modeled on retry_with_fallback: teardown the old stream, rebuild the cache
+    // bridge and mpv, then let the loading screen take over until the first frame.
+    bool switch_quality(int height, std::string& error) {
+        const double resume_position = last_time_pos_;
+        logf("player: switch quality height=%d resume=%.3f", height, resume_position);
+        quality_menu_open_ = false;
+        active_requested_height_ = height;
+
+        set_loading_status(
+            newpipe::tr("player/loading/switching_quality"),
+            height > 0 ? std::to_string(height) + "P"
+                       : newpipe::tr("player/quality/auto"));
+
+        destroy_mpv();
+        stop_stream_bridge();
+        stop_audio_prefetch();
+        if (!active_local_media_path_.empty()) {
+            std::remove(active_local_media_path_.c_str());
+            active_local_media_path_.clear();
+        }
+        if (!active_external_audio_local_path_.empty()) {
+            std::remove(active_external_audio_local_path_.c_str());
+            active_external_audio_local_path_.clear();
+        }
+
+        fallback_url_.clear();
+        fallback_referer_.clear();
+        fallback_http_header_fields_.clear();
+        fallback_quality_label_.clear();
+        fallback_external_audio_url_.clear();
+        fallback_attempted_ = false;
+        pending_external_audio_attach_ = false;
+        audio_attach_attempted_ = false;
+        audio_wait_logged_ = false;
+        active_is_live_ = false;
+        terminal_error_.clear();
+        available_heights_.clear();
+
+        const int resolve_height = height > 0 ? height : default_auto_height();
+        YouTubeResolver resolver;
+        const auto resolved = resolver.resolve_with_height(
+            request_.url,
+            resolve_height,
+            error,
+            [this](const std::string& title, const std::string& detail) {
+                set_loading_status(translate_loading_text(title), translate_loading_text(detail));
+            });
+        if (!resolved.has_value()) {
+            return false;
+        }
+
+        active_url_ = resolved->stream_url;
+        active_referer_ = resolved->referer;
+        active_http_header_fields_ = resolved->http_header_fields;
+        active_quality_label_ = resolved->quality_label;
+        active_hls_bitrate_ = resolved->hls_bitrate;
+        active_external_audio_url_ = resolved->external_audio_url;
+        fallback_url_ = resolved->fallback_stream_url;
+        fallback_referer_ = resolved->fallback_referer;
+        fallback_http_header_fields_ = resolved->fallback_http_header_fields;
+        fallback_quality_label_ = resolved->fallback_quality_label;
+        fallback_external_audio_url_ = resolved->fallback_external_audio_url;
+        active_use_ump_ = resolved->use_ump;
+        active_is_live_ = resolved->is_live;
+        available_heights_ = resolved->available_heights;
+        if (!resolved->playlist_body.empty()) {
+#ifdef __SWITCH__
+            active_local_media_path_ = "sdmc:/switch/switch_newpipe_selected.m3u8";
+#else
+            active_local_media_path_ = "/tmp/switch_newpipe_selected.m3u8";
+#endif
+            std::remove(active_local_media_path_.c_str());
+            if (!write_text_file(active_local_media_path_, resolved->playlist_body)) {
+                error = "local HLS playlist write failed";
+                return false;
+            }
+            active_url_ = active_local_media_path_;
+        }
+
+        if (!start_stream_bridge_if_needed(error)) {
+            return false;
+        }
+        start_audio_prefetch_if_needed();
+        if (!init_mpv(error)) {
+            return false;
+        }
+        if (!load_file(error)) {
+            return false;
+        }
+
+        first_frame_rendered_ = false;
+        file_loaded_ = false;
+        start_seek_applied_ = false;
+        pending_resume_position_ = resume_position;
+        mpv_events_pending_.store(true);
+        render_update_pending_.store(true);
+        return true;
+    }
+
     void loop() {
         bool running = true;
         bool paused = false;
         bool force_redraw = true;
         int loading_phase = 0;
+        int last_operation_mode_ = -1;
 
         while (running) {
             SDL_Event event;
@@ -2153,8 +2784,39 @@ private:
             if (mpv_events_pending_.exchange(false) && !drain_mpv_events()) {
                 running = false;
             }
+            if (exit_requested_) {
+                running = false;
+                continue;
+            }
+
+#if defined(__SWITCH__)
+            // Watch for docking changes and re-select the AUTO quality when the
+            // console is docked (1080p) or undocked (720p).
+            {
+                const int operation_mode = appletGetOperationMode();
+                if (operation_mode != last_operation_mode_) {
+                    last_operation_mode_ = operation_mode;
+                    const bool docked = operation_mode == AppletOperationMode_Console;
+                    logf("player: docked state changed docked=%d", docked ? 1 : 0);
+                    if (active_requested_height_ == 0 && !active_is_live_ && first_frame_rendered_) {
+                        const int target = default_auto_height();
+                        if (active_quality_label_.find(std::to_string(target)) == std::string::npos) {
+                            logf("player: auto quality switch on dock change target=%d", target);
+                            show_osd_message(
+                                newpipe::tr(docked ? "player/osd/docked_high" : "player/osd/handheld_720"),
+                                2500);
+                            std::string dock_error;
+                            if (!switch_quality(0, dock_error)) {
+                                logf("player: dock quality switch failed error=%s", dock_error.c_str());
+                            }
+                        }
+                    }
+                }
+            }
+#endif
 
             maybe_attach_external_audio();
+            maybe_checkpoint_position();
 
             bool frame_ready = false;
             if (render_context_ && render_update_pending_.exchange(false)) {
@@ -2163,7 +2825,7 @@ private:
 
             if (!first_frame_rendered_) {
                 if (!file_loaded_ && !fallback_attempted_ && !fallback_url_.empty()
-                    && std::chrono::steady_clock::now() - load_started_at_ > std::chrono::seconds(30)) {
+                    && std::chrono::steady_clock::now() - load_started_at_ > std::chrono::seconds(60)) {
                     std::string fallback_error;
                     log_line("player: load timeout before file-loaded, attempting fallback");
                     if (retry_with_fallback(fallback_error)) {
@@ -2198,7 +2860,8 @@ private:
                 continue;
             }
 
-            bool should_render = force_redraw || frame_ready || paused || osd_pinned_ || is_temporary_osd_visible();
+            bool should_render = force_redraw || frame_ready || paused || osd_pinned_
+                || quality_menu_open_ || is_temporary_osd_visible();
             if (should_render) {
                 render_frame();
                 force_redraw = paused;
@@ -2209,6 +2872,10 @@ private:
                 SDL_Delay(10);
             }
         }
+
+        // Final checkpoint on exit so Continue Watching resumes from where the
+        // player was actually closed.
+        checkpoint_position();
     }
 
     void handle_controller_button(Uint8 button, bool& running, bool& paused, bool& force_redraw) {
@@ -2221,6 +2888,30 @@ private:
             return;
         }
         logf("player: controller button=%u", static_cast<unsigned int>(button));
+        if (quality_menu_open_) {
+            switch (button) {
+                case SDL_CONTROLLER_BUTTON_DPAD_UP:
+                    quality_menu_move(-1);
+                    force_redraw = true;
+                    break;
+                case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
+                    quality_menu_move(1);
+                    force_redraw = true;
+                    break;
+                case SDL_CONTROLLER_BUTTON_A:
+                    select_quality(force_redraw);
+                    break;
+                case SDL_CONTROLLER_BUTTON_B:
+                case SDL_CONTROLLER_BUTTON_X:
+                case SDL_CONTROLLER_BUTTON_Y:
+                    quality_menu_open_ = false;
+                    force_redraw = true;
+                    break;
+                default:
+                    break;
+            }
+            return;
+        }
         switch (button) {
             case SDL_CONTROLLER_BUTTON_A:
                 running = false;
@@ -2229,6 +2920,8 @@ private:
                 toggle_pause(paused, force_redraw);
                 break;
             case SDL_CONTROLLER_BUTTON_X:
+                open_quality_menu(force_redraw);
+                break;
             case SDL_CONTROLLER_BUTTON_Y:
                 toggle_osd(force_redraw);
                 break;
@@ -2265,6 +2958,30 @@ private:
             return;
         }
         logf("player: joystick button=%u", static_cast<unsigned int>(button));
+        if (quality_menu_open_) {
+            switch (button) {
+                case 13:
+                    quality_menu_move(-1);
+                    force_redraw = true;
+                    break;
+                case 15:
+                    quality_menu_move(1);
+                    force_redraw = true;
+                    break;
+                case 0:
+                    select_quality(force_redraw);
+                    break;
+                case 1:
+                case 2:
+                case 3:
+                    quality_menu_open_ = false;
+                    force_redraw = true;
+                    break;
+                default:
+                    break;
+            }
+            return;
+        }
         switch (button) {
             case 0:
                 running = false;
@@ -2273,6 +2990,8 @@ private:
                 toggle_pause(paused, force_redraw);
                 break;
             case 2:
+                open_quality_menu(force_redraw);
+                break;
             case 3:
                 toggle_osd(force_redraw);
                 break;
@@ -2321,6 +3040,9 @@ private:
         mpv_command(mpv_, command);
         paused = !paused;
         last_pause_state_ = paused;
+        if (paused) {
+            checkpoint_position();
+        }
         show_osd_message(
             paused ? newpipe::tr("player/status/paused")
                    : newpipe::tr("player/status/playing"),
@@ -2443,24 +3165,6 @@ private:
         double target = clamp_double(
             last_time_pos_ + delta_seconds, 0.0, std::max(0.0, last_duration_ - 1.0));
 
-        bool limited = false;
-        if (const auto limit = buffered_seek_limit_seconds()) {
-            // Stay a couple of seconds inside the buffered edge: the demuxer reads
-            // ahead of the position it seeks to.
-            const double safe_limit = std::max(0.0, *limit - 2.0);
-            if (target > safe_limit) {
-                target = safe_limit;
-                limited = true;
-            }
-
-            if (delta_seconds > 0.0 && target <= last_time_pos_ + 0.5) {
-                show_osd_message(
-                    newpipe::tr("player/osd/seek_buffer_limit", format_playback_time(*limit)), 2500);
-                logf("player: seek refused, buffered up to %.1fs pos=%.1fs", *limit, last_time_pos_);
-                return;
-            }
-        }
-
         char target_text[32];
         std::snprintf(target_text, sizeof(target_text), "%.3f", target);
         const char* command[] = {"seek", target_text, "absolute", nullptr};
@@ -2479,10 +3183,7 @@ private:
                 format_playback_time(target),
                 format_playback_time(last_duration_)),
             2500);
-        logf("player: seek delta=%.1f target=%.3f limited=%d",
-             delta_seconds,
-             target,
-             limited ? 1 : 0);
+        logf("player: seek delta=%.1f target=%.3f", delta_seconds, target);
     }
 
     void render_loading_screen(int phase) {
@@ -2581,6 +3282,7 @@ private:
             if (event->event_id == MPV_EVENT_FILE_LOADED) {
                 file_loaded_ = true;
                 maybe_attach_external_audio();
+                maybe_apply_resume_seek();
                 log_line("player: mpv file-loaded event");
                 std::string detail = active_quality_label_.empty()
                     ? newpipe::tr("player/loading/buffering_first_frame")
@@ -2722,7 +3424,17 @@ private:
     std::string active_external_audio_url_;
     std::string active_external_audio_local_path_;
     bool pending_external_audio_attach_ = false;
-    std::thread audio_download_thread_;
+    pthread_t audio_download_thread_ = 0;
+    bool audio_thread_running_ = false;
+    static void* audio_prefetch_entry(void* arg) {
+        auto* ctx = static_cast<AudioPrefetchCtx*>(arg);
+        newpipe::set_thread_tag("audio-prefetch");
+        logf("player: audio prefetch thread entered");
+        logf("player: audio prefetch calling worker");
+        ctx->self->audio_prefetch_worker(ctx->url, ctx->referer, ctx->headers, ctx->use_ump);
+        delete ctx;
+        return nullptr;
+    }
     std::atomic<bool> audio_download_done_{false};
     std::atomic<bool> audio_download_success_{false};
     std::atomic<bool> audio_download_abort_{false};
@@ -2755,6 +3467,17 @@ private:
     std::condition_variable stream_cv_;
     std::condition_variable audio_cv_;
     size_t streamed_bytes_ = 0;
+    uint64_t stream_retained_edge_ = 0;
+    uint64_t stream_restart_base_ = 0;
+    uint64_t stream_jump_frontier_ = 0;
+    uint64_t stream_jump_target_ = 0;
+    bool stream_jump_pending_ = false;
+    bool stream_seek_restart_ = false;
+    uint64_t stream_seek_restart_target_ = 0;
+    uint64_t audio_retained_edge_ = 0;
+    uint64_t audio_restart_base_ = 0;
+    bool audio_seek_restart_ = false;
+    uint64_t audio_seek_restart_target_ = 0;
     // Total byte size of each cached track when the URL advertises it, used to map
     // downloaded bytes onto playable seconds for the seek guard and the OSD buffer
     // bar. Never handed to mpv, see stream_open.
@@ -2782,6 +3505,15 @@ private:
     std::string osd_message_;
     double last_time_pos_ = 0.0;
     double last_duration_ = 0.0;
+    std::vector<int> available_heights_;
+    int active_requested_height_ = 0;
+    int quality_menu_index_ = 0;
+    bool quality_menu_open_ = false;
+    bool start_seek_applied_ = false;
+    double pending_resume_position_ = 0.0;
+    bool exit_requested_ = false;
+    std::chrono::steady_clock::time_point position_checkpoint_at_{};
+    bool position_checkpoint_queued_ = false;
     double last_volume_ = 100.0;
     bool last_pause_state_ = false;
 };

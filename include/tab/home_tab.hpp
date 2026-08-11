@@ -22,6 +22,9 @@ private:
     void loadHome();
     void scheduleLoadHome(long delay_ms);
     void buildGrid();
+    void appendGridRows(size_t start_index);
+    void attachLoadMoreTriggers();
+    void loadMore();
     void cycleKiosk();
     bool allowInitialInput() const;
     void playStream(const newpipe::StreamItem& item);
@@ -35,8 +38,11 @@ private:
     newpipe::YouTubeCatalogService service_;
     std::vector<newpipe::Kiosk> kiosks_;
     std::vector<newpipe::StreamItem> items_;
+    std::vector<brls::GenericEvent::Subscription> loadMoreSubscriptions_;
     size_t kioskIndex_ = 0;
     bool initialLoadCompleted_ = false;
+    bool hasMore_ = false;
+    bool loadingMore_ = false;
     int initialLoadAttempts_ = 0;
     std::atomic<bool> interactionReady_{false};
 };

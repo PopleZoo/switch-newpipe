@@ -1,7 +1,9 @@
 #pragma once
 
 #include <mutex>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "newpipe/models.hpp"
@@ -22,6 +24,12 @@ public:
     bool is_favorite(const std::string& url);
 
     bool add_history(const StreamItem& item, std::string* error_message = nullptr);
+    bool update_history_position(
+        const std::string& video_id,
+        double position_seconds,
+        double duration_seconds,
+        std::string* error_message = nullptr);
+    std::optional<std::pair<double, double>> history_position(const std::string& video_id) const;
     bool toggle_favorite(
         const StreamItem& item,
         bool* is_now_favorite = nullptr,

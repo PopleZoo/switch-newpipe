@@ -1,53 +1,45 @@
 <brls:Box
-    width="24%"
+    width="50%"
     height="auto"
     axis="column"
-    marginRight="8"
     paddingLeft="8"
     paddingRight="8"
-    paddingTop="6"
-    paddingBottom="6"
+    paddingTop="8"
+    paddingBottom="10"
+    marginBottom="8"
     focusable="true"
-    cornerRadius="12"
+    cornerRadius="10"
     backgroundColor="#1E2023">
 
     <brls:Image
         id="stream/thumbnail"
-        width="auto"
-        height="110"
+        width="100%"
+        height="auto"
         scalingType="fill"
         cornerRadius="8"
-        marginBottom="6" />
+        backgroundColor="#141517" />
 
     <brls:Label
         id="stream/title"
-        width="auto"
+        width="100%"
         height="auto"
-        fontSize="13"
+        fontSize="17"
+        marginTop="8"
         textColor="#FFFFFF" />
 
     <brls:Label
         id="stream/channel"
-        width="auto"
+        width="100%"
         height="auto"
-        fontSize="11"
+        fontSize="13"
         textColor="#F44336"
-        marginTop="3" />
+        marginTop="4" />
 
-    <brls:Box width="auto" height="auto" axis="row" marginTop="2" justifyContent="spaceBetween">
-        <brls:Label
-            id="stream/left_meta"
-            width="auto"
-            height="auto"
-            fontSize="10"
-            textColor="#909090" />
-
-        <brls:Label
-            id="stream/right_meta"
-            width="auto"
-            height="auto"
-            fontSize="10"
-            textColor="#909090" />
-    </brls:Box>
-
+    <brls:Label
+        id="stream/meta"
+        width="100%"
+        height="auto"
+        fontSize="12"
+        textColor="#909090"
+        marginTop="4" />
 </brls:Box>

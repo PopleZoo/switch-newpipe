@@ -83,9 +83,12 @@
   - `A`: pause / resume
   - `B`: exit
   - `위 / 아래`: volume
+  - `X`: 화질 메뉴
+  - `Y`: OSD 고정 표시 토글
 - progressive 스트림용 캐시 브리지
 
-현재 seek는 꺼져 있다.
+seek는 캐시 안은 즉시, 밖은 다운로더 재시작으로 처리된다 (상세는 `docs/playback.md`).
+플레이어는 이어보기 위치를 `LibraryStore`에 10초 주기로 저장한다.
 
 ### 6. 공용 호스트 검증
 

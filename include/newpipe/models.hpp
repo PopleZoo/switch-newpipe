@@ -23,6 +23,8 @@ struct StreamItem {
     std::string view_count_text;
     std::string published_text;
     bool is_live = false;
+    double position_seconds = -1.0;
+    double duration_seconds = 0.0;
 };
 
 struct CommentItem {
@@ -39,12 +41,18 @@ struct CommentItem {
 struct HomeFeed {
     Kiosk kiosk;
     std::vector<StreamItem> items;
+    // Opaque innertube continuation token for the next page of the feed.
+    // Empty means the feed is fully loaded.
+    std::string continuation_token;
 };
 
 struct SearchResults {
     std::string query;
     std::vector<StreamItem> items;
     bool used_fallback = false;
+    // Continuation token for the next page of results. Empty means the
+    // result list is fully loaded.
+    std::string continuation_token;
 };
 
 struct StreamDetail {

@@ -196,7 +196,7 @@
       "playing": "PLAYING",
       "volume": "VOL"
     },
-    "osd_controls": "A PAUSE  B BACK  XY OSD  UPDN VOL  PAD 10S  LBRB 60S",
+    "osd_controls": "A PAUSE  B BACK  X OSD  Y QUALITY  UPDN VOL  PAD 10S  LBRB 60S",
     "osd": {
       "auto": "OSD AUTO",
       "locked": "OSD LOCKED",
@@ -207,7 +207,13 @@
       "seek": "SEEK {} / {}",
       "seek_unavailable": "SEEK UNAVAILABLE",
       "seek_live": "LIVE STREAM NO SEEK",
-      "seek_buffer_limit": "BUFFERED TO {}"
+      "seek_buffer_limit": "BUFFERED TO {}",
+      "quality_unavailable": "QUALITY SELECTION UNAVAILABLE",
+      "quality_unchanged": "QUALITY UNCHANGED",
+      "quality_switch_failed": "QUALITY SWITCH FAILED {}",
+      "resumed": "RESUMED FROM {}",
+      "docked_high": "DOCKED · 1080P",
+      "handheld_720": "HANDHELD · 720P"
     },
     "loading": {
       "preparing_playback": "PREPARING PLAYBACK",
@@ -239,7 +245,11 @@
       "requesting_720p_hls_stream": "REQUESTING 720P HLS STREAM",
       "requesting_720p_avc_stream": "REQUESTING 720P AVC STREAM",
       "requesting_progressive_stream": "REQUESTING PROGRESSIVE STREAM",
-      "requesting_720p_ump_stream": "REQUESTING 720P UMP STREAM"
+      "requesting_720p_ump_stream": "REQUESTING 720P UMP STREAM",
+      "switching_quality": "SWITCHING QUALITY"
+    },
+    "quality": {
+      "auto": "AUTO"
     }
   },
   "stream": {

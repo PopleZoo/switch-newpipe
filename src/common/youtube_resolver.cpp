@@ -261,6 +261,56 @@ bool has_preferred_adaptive_mp4(const json& adaptive_formats, int preferred_heig
     return pick_preferred_adaptive_video_format(adaptive_formats, preferred_height).has_value();
 }
 
+void merge_heights(std::vector<int>& out, const std::vector<int>& more) {
+    for (const int height : more) {
+        if (height <= 0) {
+            continue;
+        }
+        bool seen = false;
+        for (const int existing : out) {
+            if (existing == height) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            out.push_back(height);
+        }
+    }
+}
+
+// Heights the resolver can actually serve: progressive video/mp4 formats, AVC
+// video-only adaptive formats, and (when the caller merges them in) HLS
+// variants. WebM is excluded because the bundled mpv build cannot decode VP9.
+std::vector<int> format_heights(const json& formats, bool adaptive_video_only) {
+    std::vector<int> heights;
+    if (!formats.is_array()) {
+        return heights;
+    }
+    for (const auto& format : formats) {
+        if (!format.is_object() || !format.contains("url") || !format.at("url").is_string()) {
+            continue;
+        }
+        const std::string mime = get_string(format, "mimeType");
+        if (mime.find("video/mp4") == std::string::npos) {
+            continue;
+        }
+        if (adaptive_video_only
+            && (mime.find("mp4a") != std::string::npos || mime.find("avc1") == std::string::npos)) {
+            continue;
+        }
+        const int height = format.value("height", -1);
+        if (height > 0) {
+            heights.push_back(height);
+        }
+    }
+    return heights;
+}
+
+void finalize_heights(std::vector<int>& heights) {
+    std::sort(heights.begin(), heights.end(), std::greater<int>());
+}
+
 std::optional<ResolvedPlayback> build_adaptive_split_playback(
     const json& adaptive_formats,
     const std::string& video_id,
@@ -564,7 +614,8 @@ struct SelectedHlsPlayback {
 std::optional<SelectedHlsPlayback> pick_preferred_hls_playback(
     const std::string& manifest_url,
     const std::string& manifest_body,
-    int preferred_height) {
+    int preferred_height,
+    std::vector<int>& variant_heights) {
     std::vector<std::string> lines;
     std::stringstream stream(manifest_body);
     std::string line;
@@ -609,6 +660,18 @@ std::optional<SelectedHlsPlayback> pick_preferred_hls_playback(
 
         const int height = extract_resolution_height(current);
         const std::string candidate_uri = absolutize_url(manifest_url, lines[i + 1]);
+        if (height > 0) {
+            bool seen = false;
+            for (const int existing : variant_heights) {
+                if (existing == height) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                variant_heights.push_back(height);
+            }
+        }
         auto choose_candidate = [&]() {
             selected_stream_inf = current;
             selected_uri = candidate_uri;
@@ -659,7 +722,8 @@ std::optional<ResolvedPlayback> resolve_ios_hls_playback(
     HttpClient* client,
     const std::string& video_id,
     int preferred_height,
-    std::string& error_message) {
+    std::string& error_message,
+    std::vector<int>* variant_heights = nullptr) {
     const int requested_height = preferred_height;
     const auto root = fetch_player_response(
         client,
@@ -697,11 +761,15 @@ std::optional<ResolvedPlayback> resolve_ios_hls_playback(
         return std::nullopt;
     }
 
+    std::vector<int> collected_heights;
     const auto selected_playback = pick_preferred_hls_playback(
-        hls_manifest_url, *master_manifest, requested_height);
+        hls_manifest_url, *master_manifest, requested_height, collected_heights);
     if (!selected_playback.has_value()) {
         error_message = std::to_string(requested_height) + "p HLS variant not found";
         return std::nullopt;
+    }
+    if (variant_heights) {
+        *variant_heights = std::move(collected_heights);
     }
 
     ResolvedPlayback result;
@@ -752,7 +820,18 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve(
     const std::string& url,
     std::string& error_message,
     ResolverStatusCallback on_status) {
-    auto result = resolve_internal(url, error_message, on_status);
+    const AppSettings settings = SettingsStore::instance().settings();
+    const int default_height =
+        settings.playback_quality == PlaybackQualityMode::DATA_SAVER ? 480 : 720;
+    return resolve_with_height(url, default_height, error_message, std::move(on_status));
+}
+
+std::optional<ResolvedPlayback> YouTubeResolver::resolve_with_height(
+    const std::string& url,
+    int preferred_height,
+    std::string& error_message,
+    ResolverStatusCallback on_status) {
+    auto result = resolve_internal(url, preferred_height, error_message, std::move(on_status));
     if (result.has_value()) {
         apply_throttle_transform(*result);
     }
@@ -761,6 +840,7 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve(
 
 std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
     const std::string& url,
+    int preferred_height,
     std::string& error_message,
     ResolverStatusCallback on_status) {
     const auto video_id = extract_video_id(url);
@@ -771,8 +851,6 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
 
     report_status(on_status, "RESOLVING YOUTUBE STREAM", "CONTACTING PLAYER API");
     const AppSettings settings = SettingsStore::instance().settings();
-    const int preferred_height =
-        settings.playback_quality == PlaybackQualityMode::DATA_SAVER ? 480 : 720;
     const bool prefer_progressive_first =
         settings.playback_quality == PlaybackQualityMode::COMPATIBILITY;
     const bool allow_adaptive_720 =
@@ -796,22 +874,34 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
 
     const json streaming = root->value("streamingData", json::object());
     report_status(on_status, "RESOLVING YOUTUBE STREAM", "SELECTING PLAYABLE FORMAT");
+    const auto progressive_formats = streaming.value("formats", json::array());
+    const auto adaptive_formats = streaming.value("adaptiveFormats", json::array());
+    std::vector<int> available_heights;
+    merge_heights(available_heights, format_heights(progressive_formats, false));
+    merge_heights(available_heights, format_heights(adaptive_formats, true));
     const auto progressive_playback = build_progressive_playback(
-        pick_preferred_format(streaming.value("formats", json::array()), preferred_height),
+        pick_preferred_format(progressive_formats, preferred_height),
         *video_id);
 
     if (prefer_progressive_first && progressive_playback.has_value()) {
-        return progressive_playback;
+        auto result = *progressive_playback;
+        result.available_heights = available_heights;
+        finalize_heights(result.available_heights);
+        return result;
     }
 
     if (allow_adaptive_720) {
         const auto adaptive_playback =
-            build_adaptive_split_playback(streaming.value("adaptiveFormats", json::array()), *video_id, 720);
+            build_adaptive_split_playback(adaptive_formats, *video_id, 720);
         report_status(on_status, "RESOLVING YOUTUBE STREAM", "REQUESTING 720P HLS STREAM");
         std::string ios_error;
+        std::vector<int> hls_heights;
         if (const auto ios_playback =
-                resolve_ios_hls_playback(client_, *video_id, 720, ios_error)) {
+                resolve_ios_hls_playback(client_, *video_id, 720, ios_error, &hls_heights)) {
             auto result = *ios_playback;
+            merge_heights(available_heights, hls_heights);
+            result.available_heights = available_heights;
+            finalize_heights(result.available_heights);
             // Fallback: progressive (ratebypass=yes, no throttle) > adaptive (throttled)
             if (progressive_playback.has_value()) {
                 result.fallback_stream_url = progressive_playback->stream_url;
@@ -871,6 +961,8 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
                         ump_playback->fallback_http_header_fields = progressive_playback->http_header_fields;
                         ump_playback->fallback_quality_label = progressive_playback->quality_label;
                     }
+                    ump_playback->available_heights = available_heights;
+                    finalize_heights(ump_playback->available_heights);
                     logf("youtube: selected tokenless Android VR UMP video=%s", video_id->c_str());
                     return *ump_playback;
                 }
@@ -894,32 +986,45 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
                 result.fallback_quality_label = adaptive_playback->quality_label;
                 result.fallback_external_audio_url = adaptive_playback->external_audio_url;
             }
+            result.available_heights = available_heights;
+            finalize_heights(result.available_heights);
             return result;
         }
 
         if (adaptive_playback.has_value()) {
             report_status(on_status, "RESOLVING YOUTUBE STREAM", "REQUESTING 720P AVC STREAM");
-            return *adaptive_playback;
+            auto result = *adaptive_playback;
+            result.available_heights = available_heights;
+            finalize_heights(result.available_heights);
+            return result;
         }
     }
 
     if (progressive_playback.has_value()) {
-        return progressive_playback;
+        auto result = *progressive_playback;
+        result.available_heights = available_heights;
+        finalize_heights(result.available_heights);
+        return result;
     }
 
     const std::string dash_manifest_url = get_string(streaming, "dashManifestUrl");
     if (allow_adaptive_720
         && !dash_manifest_url.empty()
-        && has_preferred_adaptive_mp4(streaming.value("adaptiveFormats", json::array()), 720)) {
+        && has_preferred_adaptive_mp4(adaptive_formats, 720)) {
         ResolvedPlayback result;
         result.stream_url = dash_manifest_url;
         result.referer = "https://www.youtube.com/watch?v=" + *video_id;
         result.quality_label = "720p DASH";
+        result.available_heights = available_heights;
+        finalize_heights(result.available_heights);
         return result;
     }
 
     if (progressive_playback.has_value()) {
-        return progressive_playback;
+        auto result = *progressive_playback;
+        result.available_heights = available_heights;
+        finalize_heights(result.available_heights);
+        return result;
     }
 
     const std::string hls_manifest_url = get_string(streaming, "hlsManifestUrl");
@@ -929,6 +1034,8 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
         result.referer = "https://www.youtube.com/watch?v=" + *video_id;
         result.quality_label = "HLS";
         result.is_live = true;
+        result.available_heights = available_heights;
+        finalize_heights(result.available_heights);
         return result;
     }
 
@@ -937,6 +1044,8 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
         result.stream_url = dash_manifest_url;
         result.referer = "https://www.youtube.com/watch?v=" + *video_id;
         result.quality_label = "DASH";
+        result.available_heights = available_heights;
+        finalize_heights(result.available_heights);
         return result;
     }
 

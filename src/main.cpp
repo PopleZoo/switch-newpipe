@@ -1,5 +1,6 @@
 #if defined(__SWITCH__)
 #include <switch.h>
+#include <curl/curl.h>
 #endif
 
 #include <borealis.hpp>
@@ -118,6 +119,15 @@ int main(int argc, char* argv[]) {
 
     newpipe::init_log();
     newpipe::log_line("main: start");
+    newpipe::set_thread_tag("main");
+    newpipe::install_fault_handler();
+#if defined(__SWITCH__)
+    // Init libcurl once on the main thread before any worker threads exist.
+    // Without this, the first lazy init races between the video download thread
+    // and the audio prefetch thread and crashes the player.
+    const CURLcode curl_rc = curl_global_init(CURL_GLOBAL_ALL);
+    newpipe::logf("main: curl_global_init rc=%d", static_cast<int>(curl_rc));
+#endif
     try {
         std::string auth_error;
         if (!newpipe::AuthStore::instance().load(&auth_error) && !auth_error.empty()) {

@@ -21,6 +21,9 @@ public:
 private:
     void refresh();
     void buildGrid();
+    void appendGridRows(size_t start_index);
+    void attachLoadMoreTriggers();
+    void loadMore();
     void clearGrid();
     void showSignedOutState();
     void openSessionDialog();
@@ -37,5 +40,8 @@ private:
 
     newpipe::YouTubeCatalogService service_;
     std::vector<newpipe::StreamItem> items_;
+    std::vector<brls::GenericEvent::Subscription> loadMoreSubscriptions_;
+    bool hasMore_ = false;
+    bool loadingMore_ = false;
     std::atomic<bool> interactionReady_{false};
 };

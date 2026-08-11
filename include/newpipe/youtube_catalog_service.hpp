@@ -33,15 +33,27 @@ public:
 
     std::vector<Kiosk> list_kiosks() const override;
     std::optional<HomeFeed> get_home_feed(const std::string& kiosk_id) const override;
+    std::optional<HomeFeed> get_home_feed_more(const std::string& kiosk_id) const;
     std::optional<HomeFeed> get_subscriptions_feed() const;
+    std::optional<HomeFeed> get_subscriptions_feed_more() const;
     std::optional<HomeFeed> get_related_feed(const StreamItem& item) const;
     std::optional<HomeFeed> get_channel_feed(const StreamItem& item) const;
     std::optional<HomeFeed> get_playlist_feed(const StreamItem& item) const;
     std::optional<CommentPage> get_comments(const StreamItem& item) const;
     SearchResults search(const std::string& query) const override;
+    SearchResults search_more(const std::string& query) const;
     std::optional<StreamDetail> get_stream_detail(const std::string& url) const override;
 
 private:
+    bool fetch_continuation_page(
+        const std::string& token,
+        const std::string& api_url,
+        const std::vector<HttpHeader>& headers,
+        bool android_client,
+        bool allow_short_videos,
+        size_t limit,
+        std::vector<StreamItem>& out_items,
+        std::string& next_token) const;
     std::optional<HomeFeed> fetch_home_feed(
         const std::string& kiosk_id,
         const std::string& title,
@@ -79,6 +91,7 @@ private:
     mutable std::unordered_map<std::string, HomeFeed> channel_feed_cache_;
     mutable std::unordered_map<std::string, HomeFeed> playlist_feed_cache_;
     mutable std::unordered_map<std::string, HomeFeed> authenticated_browse_cache_;
+    mutable std::unordered_map<std::string, std::string> search_continuation_cache_;
     mutable std::unordered_map<std::string, StreamDetail> detail_cache_;
     mutable std::unordered_map<std::string, CommentPage> comments_cache_;
     mutable std::string error_message_;

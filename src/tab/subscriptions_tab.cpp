@@ -11,7 +11,7 @@
 #include "view/tab_focus.hpp"
 
 namespace {
-constexpr size_t kGridColumns = 4;
+constexpr size_t kGridColumns = 2;
 }
 
 SubscriptionsTab::SubscriptionsTab() : service_() {
@@ -92,6 +92,9 @@ void SubscriptionsTab::refresh() {
     }
 
     this->items_ = feed->items;
+    this->hasMore_ = !feed->continuation_token.empty();
+    newpipe::logf("subscriptions: feed items=%zu hasMore=%d",
+                  this->items_.size(), this->hasMore_ ? 1 : 0);
     this->buildGrid();
 
     if (this->statusLabel) {
@@ -122,6 +125,7 @@ void SubscriptionsTab::buildGrid() {
     }
 
     newpipe::release_grid_focus(this, this->gridBox);
+    this->loadMoreSubscriptions_.clear();
     this->gridBox->clearViews();
     for (size_t i = 0; i < this->items_.size(); i += kGridColumns) {
         auto* row = new brls::Box(brls::Axis::ROW);
@@ -145,10 +149,99 @@ void SubscriptionsTab::buildGrid() {
 
         this->gridBox->addView(row);
     }
+
+    this->attachLoadMoreTriggers();
+}
+
+void SubscriptionsTab::appendGridRows(size_t start_index) {
+    if (!this->gridBox) {
+        return;
+    }
+
+    for (size_t i = start_index; i < this->items_.size(); i += kGridColumns) {
+        auto* row = new brls::Box(brls::Axis::ROW);
+        row->setMarginBottom(8);
+
+        for (size_t j = i; j < i + kGridColumns && j < this->items_.size(); j++) {
+            auto* card = new StreamCard();
+            card->setData(this->items_[j]);
+            const size_t idx = j;
+            card->registerClickAction([this, idx](brls::View*) {
+                this->playStream(this->items_[idx]);
+                return true;
+            });
+            card->registerAction(newpipe::tr("common/info"), brls::ControllerButton::BUTTON_Y, [this, idx](brls::View*) {
+                this->openStream(this->items_[idx]);
+                return true;
+            });
+            card->addGestureRecognizer(new brls::TapGestureRecognizer(card));
+            row->addView(card);
+        }
+
+        this->gridBox->addView(row);
+    }
+
+    this->attachLoadMoreTriggers();
+}
+
+void SubscriptionsTab::attachLoadMoreTriggers() {
+    if (!this->gridBox || !this->hasMore_ || this->loadingMore_) {
+        return;
+    }
+
+    auto& children = this->gridBox->getChildren();
+    if (children.size() < 2) {
+        return;
+    }
+
+    for (size_t r = children.size() - 2; r < children.size(); r++) {
+        auto* row = dynamic_cast<brls::Box*>(children[r]);
+        if (!row) {
+            continue;
+        }
+        for (brls::View* card : row->getChildren()) {
+            this->loadMoreSubscriptions_.push_back(
+                card->getFocusEvent()->subscribe([this](brls::View*) {
+                    this->loadMore();
+                }));
+        }
+    }
+}
+
+void SubscriptionsTab::loadMore() {
+    if (this->loadingMore_ || !this->hasMore_) {
+        return;
+    }
+
+    this->loadingMore_ = true;
+    newpipe::log_line("subscriptions: loadMore start");
+    const auto feed = this->service_.get_subscriptions_feed_more();
+    if (!feed.has_value()) {
+        this->hasMore_ = false;
+        this->loadingMore_ = false;
+        newpipe::logf("subscriptions: loadMore failed error=%s",
+                      this->service_.error_message().c_str());
+        return;
+    }
+
+    const size_t old_size = this->items_.size();
+    this->items_ = feed->items;
+    this->hasMore_ = !feed->continuation_token.empty();
+    newpipe::logf("subscriptions: loadMore done old=%zu new=%zu hasMore=%d",
+                  old_size, this->items_.size(), this->hasMore_ ? 1 : 0);
+    this->appendGridRows(old_size);
+
+    if (this->statusLabel) {
+        this->statusLabel->setText(
+            newpipe::tr("common/count_with_title", feed->kiosk.title, this->items_.size()));
+    }
+    this->loadingMore_ = false;
 }
 
 void SubscriptionsTab::clearGrid() {
     this->items_.clear();
+    this->hasMore_ = false;
+    this->loadingMore_ = false;
     if (this->gridBox) {
         newpipe::release_grid_focus(this, this->gridBox);
         this->gridBox->clearViews();

@@ -25,7 +25,9 @@
   - `위 / 아래`: 볼륨
   - `좌 / 우`: 10초 이동
   - `LB / RB`: 60초 이동
-  - `X / Y`: OSD 고정 표시 토글
+  - `X`: 화질 메뉴
+  - `Y`: OSD 고정 표시 토글
+  - 화질 메뉴가 열린 동안: `위 / 아래` 선택, `A` 적용, `B / X / Y` 닫기
 
 ## 현재 해석 전략
 
@@ -113,25 +115,67 @@ mpv가 세그먼트를 직접 가져오므로 전체 구간 이동이 된다. �
 ### 스트림 브리지 경로 (progressive / UMP)
 
 브리지는 다운로드를 캐시 파일에 순차적으로 쌓는다. `switchcache` stream callback의
-`seek_fn`은 **이미 받아둔 바이트 안에서만** 성공하고, 그 밖은 거절한다. 다운로더가
-앞으로만 진행하기 때문에, 아직 안 받은 위치를 기다리면 남은 다운로드가 끝날 때까지
-demuxer가 멈춰버린다.
+`seek_fn`은 이미 받아둔 영역(초기 prefix `[0, retained_edge]` 또는 현재 다운로드
+영역 `[restart_base, streamed_bytes]`) 안의 offset은 캐시에서 즉시 서빙한다.
 
-- `clen`으로 총 크기를 알 때는 `받은 바이트 / 총 바이트`를 시간으로 환산해서
-  버퍼 끝 2초 앞까지만 이동을 허용한다. 가변 비트레이트에서는 근사치다.
-- 분리된 오디오 트랙이 있으면 video / audio 중 더 느린 쪽 비율을 쓴다. 이동 지점이
-  두 캐시 안에 모두 들어와야 한다.
-- 앞으로 이동이 버퍼 끝에 막히면 이동하지 않고 OSD에 `BUFFERED TO mm:ss`를 띄운다.
+버퍼 밖으로 이동하면 seek을 거절하지 않고 다운로더를 해당 byte offset에서
+**재시작**한다:
+
+- `stream_seek`가 이동 지점을 `stream_seek_restart_` / `audio_seek_restart_` 플래그와
+  타깃으로 기록하고 `stream_cv_` / `audio_cv_`를 알린다.
+- 영상 다운로드 루프(`perform_chunked_ranged_download`)와 오디오 prefetch 루프
+  (UMP / ranged 양쪽)는 다음 반복에서 플래그를 소비해 `streamed_bytes_` /
+  `audio_downloaded_bytes_`를 타깃으로 되돌리고 그 위치부터 다시 받는다.
+- fragmented MP4에서 mov demuxer가 sidx로 계산한 moof offset으로 seek하므로
+  재시작 지점은 항상 fragment 경계이고, 바이트가 도착하면 깨끗하게 재생이 재개된다.
+- 앞으로 이동이 버퍼 끝에 막히면 막지 않는다. 이동을 수락하고 다운로더를 재시작한 뒤
+  재생이 따라잡으면 mpv가 스스로 버퍼링 상태를 표시한다.
+- 분리된 오디오 트랙이 있으면 video / audio 양쪽 다운로더를 모두 재시작한다.
 - 라이브는 이동하지 않는다.
 
-`size_fn`은 일부러 null로 둔다. byte offset 이동에는 총 크기가 필요 없고, 크기를
-알려주면 fragmented MP4에서 ffmpeg `mov_read_mfra()`가 fragment index를 찾으려고
-파일 끝으로 이동한다. 부분만 받은 캐시 파일에서 절대 줄 수 없는 offset이 바로 그
-파일 끝이다.
+`size_fn`은 총 크기를 알려준다. 크기를 모르면 ffmpeg의 mov demuxer가 fragmented
+MP4를 열기 전에 fragment index 전체를 훑으므로(slow 스트림에서 "파일 전체를 받고
+재생"이 된다) 열기까지 걸린다. 크기를 주면 demuxer는 열 때 파일 끝으로 한 번
+이동한다(mfra 확인 / moov-at-end). 이 때 seek이 버퍼 밖이므로 앞쪽 점프
+(`stream_jump_*`)가 동작한다:
+
+- 앞쪽 점프: 다운로더가 점프 지점(파일 끝)에서 한 chunk를 내려받은 뒤, 저장해둔
+  기존 frontier로 돌아와 순차 다운로드를 이어간다. 점프에 생긴 갭은 순차 다운로드가
+  채운다.
+- `stream_read`는 `[0, retained_edge]` prefix와 `[restart_base, streamed_bytes]`
+  활성 영역만 원본으로 서빙하고, 사이 갭은 채워질 때까지 대기한다. 잘못된 바이트를
+  넘기지 않는다.
+- EOF를 넘어가는 seek은 점프하지 않고 읽기에서 EOF로 처리한다.
 
 > **회귀 시 확인 순서:** 재생 자체가 깨지면 `stream_open`의 `seek_fn`을 다시
 > `nullptr`로 돌려 seek만 끄면 이전 동작으로 복귀한다. 720p UMP 경로가 실기에서
 > 검증된 경로라 이 순서를 지킬 것.
+
+## 화질 선택
+
+- `X`를 누르면 현재 영상에서 실제 재생 가능한 해상도 목록을 중앙 패널로 띄운다.
+  목록은 resolver가 수집한다. `ResolvedPlayback::available_heights`:
+  - progressive `video/mp4` format 높이
+  - adaptive `video/mp4` + `avc1` video-only format 높이
+  - iOS HLS master manifest의 variant 높이
+  - WebM/VP9은 데코더가 없어 목록에서 제외된다
+- `A`로 선택하면 해당 높이로 `resolve_with_height()`로 재해석한 뒤 현재 재생
+  위치를 유지한 채 스트림/오디오 브리지를 재구성하고 mpv를 다시 로드한다.
+- `AUTO`는 휴대 모드 720p, 독 모드(`AppletOperationMode_Console`) 1080p 기준으로
+  해석한다.
+- 라이브 스트림은 화질 선택이 불가능하다.
+- 실패하면 이전 화질로 자동 복구하고, 복구도 실패하면 플레이어를 종료한다.
+
+## 이어보기 (Continue Watching)
+
+- 플레이어는 10초마다, 일시정지 시, 종료 시에 현재 위치를
+  `LibraryStore::update_history_position(video_id, pos, dur)`로
+  `sdmc:/switch/switch_newpipe_library.json`에 저장한다 (최근 시청 기록의
+  `position_seconds` / `duration_seconds` 필드).
+- 영상을 다시 열면 `build_playback_request`가 저장된 위치를 찾아
+  `PlaybackRequest::start_position_seconds`로 전달한다.
+- 플레이어는 파일 로드 후 해당 위치로 seek한다. 브리지 경로면 버퍼 밖 위치라도
+  위 재시작 메커니즘으로 그 지점부터 받아서 재생한다.
 
 ## 로그
 
@@ -140,8 +184,8 @@ demuxer가 멈춰버린다.
 
 ## 현재 제한
 
-- 브리지 경로의 seek은 이미 받아둔 구간 안에서만 된다
-- 화질 수동 선택 UI 없음
+- 브리지 경로의 seek은 캐시 안 영역은 즉시, 밖은 다운로더 재시작으로 처리된다 (실기 검증 대기)
+- 화질 선택 / 이어보기 구현 완료, 실기 검증 대기
 - tokenless Android VR UMP는 실기에서 71,936,808 B video와 8,565,660 B audio 전체 완료
 - 라이브/장시간 스트림의 예외 처리 강화가 더 필요
 - 플레이어 OSD는 들어갔지만 실기 UI 튜닝은 아직 필요하다

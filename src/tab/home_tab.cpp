@@ -11,7 +11,7 @@
 #include "view/tab_focus.hpp"
 
 namespace {
-constexpr size_t kGridColumns = 4;
+constexpr size_t kGridColumns = 2;
 }
 
 HomeTab::HomeTab() : service_() {
@@ -105,7 +105,8 @@ void HomeTab::loadHome() {
 
     initialLoadCompleted_ = true;
     items_ = feed->items;
-    newpipe::logf("home: feed=%s items=%zu", feed->kiosk.id.c_str(), items_.size());
+    hasMore_ = !feed->continuation_token.empty();
+    newpipe::logf("home: feed=%s items=%zu hasMore=%d", feed->kiosk.id.c_str(), items_.size(), hasMore_ ? 1 : 0);
     buildGrid();
 
     if (statusLabel) {
@@ -134,6 +135,7 @@ void HomeTab::buildGrid() {
 
     newpipe::logf("home: buildGrid items=%zu", items_.size());
     newpipe::release_grid_focus(this, gridBox);
+    loadMoreSubscriptions_.clear();
     gridBox->clearViews();
     for (size_t i = 0; i < items_.size(); i += kGridColumns) {
         auto* row = new brls::Box(brls::Axis::ROW);
@@ -157,6 +159,102 @@ void HomeTab::buildGrid() {
 
         gridBox->addView(row);
     }
+
+    attachLoadMoreTriggers();
+}
+
+void HomeTab::appendGridRows(size_t start_index) {
+    if (!gridBox) {
+        return;
+    }
+
+    for (size_t i = start_index; i < items_.size(); i += kGridColumns) {
+        auto* row = new brls::Box(brls::Axis::ROW);
+        row->setMarginBottom(8);
+
+        for (size_t j = i; j < i + kGridColumns && j < items_.size(); j++) {
+            auto* card = new StreamCard();
+            card->setData(items_[j]);
+            const size_t idx = j;
+            card->registerClickAction([this, idx](brls::View*) {
+                playStream(items_[idx]);
+                return true;
+            });
+            card->registerAction(newpipe::tr("common/info"), brls::ControllerButton::BUTTON_Y, [this, idx](brls::View*) {
+                openStream(items_[idx]);
+                return true;
+            });
+            card->addGestureRecognizer(new brls::TapGestureRecognizer(card));
+            row->addView(card);
+        }
+
+        gridBox->addView(row);
+    }
+
+    attachLoadMoreTriggers();
+}
+
+void HomeTab::attachLoadMoreTriggers() {
+    if (!gridBox || !hasMore_ || loadingMore_) {
+        return;
+    }
+
+    auto& children = gridBox->getChildren();
+    if (children.size() < 2) {
+        return;
+    }
+
+    // Focus reaching the last two rows means the user has scrolled near the
+    // bottom, so the next page is fetched then. New rows append below and get
+    // their own triggers, so scrolling can continue indefinitely.
+    for (size_t r = children.size() - 2; r < children.size(); r++) {
+        auto* row = dynamic_cast<brls::Box*>(children[r]);
+        if (!row) {
+            continue;
+        }
+        for (brls::View* card : row->getChildren()) {
+            loadMoreSubscriptions_.push_back(card->getFocusEvent()->subscribe([this](brls::View*) {
+                this->loadMore();
+            }));
+        }
+    }
+}
+
+void HomeTab::loadMore() {
+    if (loadingMore_ || !hasMore_ || !initialLoadCompleted_) {
+        return;
+    }
+    if (kiosks_.empty()) {
+        return;
+    }
+
+    loadingMore_ = true;
+    newpipe::log_line("home: loadMore start");
+    const auto feed = service_.get_home_feed_more(kiosks_[kioskIndex_].id);
+    if (!feed.has_value()) {
+        hasMore_ = false;
+        loadingMore_ = false;
+        newpipe::logf("home: loadMore failed error=%s", service_.error_message().c_str());
+        return;
+    }
+
+    const size_t old_size = items_.size();
+    items_ = feed->items;
+    hasMore_ = !feed->continuation_token.empty();
+    newpipe::logf("home: loadMore done old=%zu new=%zu hasMore=%d",
+                  old_size, items_.size(), hasMore_ ? 1 : 0);
+    appendGridRows(old_size);
+
+    if (statusLabel) {
+        std::string title = feed->kiosk.title;
+        const std::string option_key = "settings/home_kiosk/options/" + feed->kiosk.id;
+        const std::string translated = newpipe::tr(option_key);
+        if (!translated.empty() && translated != option_key) {
+            title = translated;
+        }
+        statusLabel->setText(newpipe::tr("common/count_with_title", title, items_.size()));
+    }
+    loadingMore_ = false;
 }
 
 void HomeTab::cycleKiosk() {

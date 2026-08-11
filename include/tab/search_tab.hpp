@@ -21,6 +21,9 @@ public:
 private:
     void doSearch(const std::string& query);
     void buildGrid();
+    void appendGridRows(size_t start_index);
+    void attachLoadMoreTriggers();
+    void loadMore();
     bool allowInitialInput() const;
     void playStream(const newpipe::StreamItem& item);
     void openStream(const newpipe::StreamItem& item);
@@ -32,6 +35,9 @@ private:
 
     newpipe::YouTubeCatalogService service_;
     std::vector<newpipe::StreamItem> items_;
+    std::vector<brls::GenericEvent::Subscription> loadMoreSubscriptions_;
     std::string lastQuery_;
+    bool hasMore_ = false;
+    bool loadingMore_ = false;
     std::atomic<bool> interactionReady_{false};
 };

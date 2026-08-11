@@ -66,11 +66,13 @@ install_required_packages \
   switch-mesa switch-sdl2 switch-curl
 
 install_optional_package switch-freetype
-install_optional_package switch-harfbuzz
+# harfbuzz built from source to fix CFF::Encoding::sanitize crash on Switch
+# install_optional_package switch-harfbuzz
 install_optional_package switch-libfribidi
 install_optional_package switch-libass
 install_optional_package switch-dav1d
 install_optional_package switch-liblua51
+install_optional_package switch-libwebp
 
 if ! command -v aarch64-none-elf-pkg-config >/dev/null 2>&1; then
   echo "ERROR: switch-pkg-config did not install aarch64-none-elf-pkg-config"
@@ -86,6 +88,39 @@ if ! command -v meson &>/dev/null; then
 fi
 
 mkdir -p "$WORK_DIR"
+
+# ─── HarfBuzz 빌드 (Switch에서 CFF::Encoding::sanitize 크래시 수정) ───
+HB_VER="10.0.1"
+HB_MARKER="$PORTLIBS_PREFIX/lib/.custom_harfbuzz_installed"
+if [ ! -f "$HB_MARKER" ]; then
+  echo ""
+  echo "=== Building harfbuzz $HB_VER from source ==="
+  cd "$WORK_DIR"
+  HB_TAR="harfbuzz-${HB_VER}.tar.xz"
+  HB_SRC="harfbuzz-${HB_VER}"
+  if [ ! -d "$HB_SRC" ]; then
+    if [ ! -f "$HB_TAR" ]; then
+      echo "Downloading harfbuzz $HB_VER..."
+      curl -L -o "$HB_TAR" "https://github.com/harfbuzz/harfbuzz/archive/refs/tags/${HB_VER}.tar.gz"
+    fi
+    tar xf "$HB_TAR"
+  fi
+  cd "$HB_SRC"
+  rm -rf build
+  /opt/devkitpro/meson-cross.sh switch build \
+    -Dfreetype=enabled \
+    -Dglib=disabled \
+    -Dcairo=disabled \
+    -Dgraphite2=disabled \
+    -Dicu=disabled \
+    -Dtests=disabled \
+    -Ddocs=disabled \
+    -Dbenchmark=disabled
+  meson compile -C build
+  DESTDIR="" meson install -C build
+  touch "$HB_MARKER"
+  echo "=== harfbuzz build complete ==="
+fi
 
 # ─── FFmpeg 빌드 ───
 # 이미 커스텀 ffmpeg가 설치되어 있으면 건너뛰기

@@ -734,6 +734,85 @@ void collect_stream_items(
     }
 }
 
+// Returns the first continuation token found in a response. Feed responses
+// carry it in a trailing continuationItemRenderer; continuation responses
+// carry the *next* token in the same shape.
+std::string extract_continuation_token(const json& node) {
+    if (node.is_null()) {
+        return {};
+    }
+
+    if (node.is_object()) {
+        const auto it = node.find("continuationItemRenderer");
+        if (it != node.end() && it->is_object()) {
+            const std::string token = get_string(
+                it->value("continuationEndpoint", json::object())
+                    .value("continuationCommand", json::object()),
+                "token");
+            if (!token.empty()) {
+                return token;
+            }
+        }
+
+        for (const auto& entry : node.items()) {
+            const std::string token = extract_continuation_token(entry.value());
+            if (!token.empty()) {
+                return token;
+            }
+        }
+        return {};
+    }
+
+    if (node.is_array()) {
+        for (const auto& child : node) {
+            const std::string token = extract_continuation_token(child);
+            if (!token.empty()) {
+                return token;
+            }
+        }
+    }
+
+    return {};
+}
+
+// Continuation responses deliver the next batch of items inside
+// onResponseReceivedEndpoints[].appendContinuationItemsAction or
+// .continuationItemsCommand -> continuationItems.
+void collect_continuation_items(
+    const json& root,
+    bool allow_short_videos,
+    size_t limit,
+    std::unordered_set<std::string>& seen_ids,
+    std::vector<StreamItem>& out_items) {
+    const json endpoints = root.value("onResponseReceivedEndpoints", json::array());
+    if (!endpoints.is_array()) {
+        return;
+    }
+
+    for (const auto& endpoint : endpoints) {
+        if (!endpoint.is_object()) {
+            continue;
+        }
+
+        for (const char* key : {"appendContinuationItemsAction", "continuationItemsCommand"}) {
+            const json cmd = endpoint.value(key, json::object());
+            if (!cmd.is_object()) {
+                continue;
+            }
+
+            const json items = cmd.value("continuationItems", json::array());
+            if (!items.is_array()) {
+                continue;
+            }
+
+            collect_stream_items(items, allow_short_videos, limit, seen_ids, out_items);
+            if (out_items.size() >= limit) {
+                return;
+            }
+        }
+    }
+}
+
 void collect_playlist_items(
     const json& node,
     bool allow_short_videos,
@@ -1163,6 +1242,7 @@ std::optional<HomeFeed> YouTubeCatalogService::fetch_home_feed(
     HomeFeed feed;
     feed.kiosk = {kiosk_id, title};
     feed.items = results.items;
+    feed.continuation_token = results.continuation_token;
     home_feed_cache_[kiosk_id] = feed;
     logf("youtube: home feed id=%s query=%s items=%zu",
          kiosk_id.c_str(),
@@ -1269,6 +1349,7 @@ std::optional<HomeFeed> YouTubeCatalogService::fetch_authenticated_browse_feed(
     feed.kiosk = {browse_id, title};
     std::unordered_set<std::string> seen_ids;
     collect_stream_items(root, allow_short_videos, limit, seen_ids, feed.items);
+    feed.continuation_token = extract_continuation_token(root);
     if (feed.items.empty()) {
         this->error_message_ = "구독 피드에서 영상 항목을 찾지 못했습니다";
         return std::nullopt;
@@ -1661,6 +1742,7 @@ SearchResults YouTubeCatalogService::fetch_search_results(
 
     std::unordered_set<std::string> seen_ids;
     collect_stream_items(root, allow_short_videos, limit, seen_ids, results.items);
+    results.continuation_token = extract_continuation_token(root);
     if (results.items.empty()) {
         error_message_ = "유튜브 검색 결과가 없습니다";
         return results;
@@ -1723,9 +1805,231 @@ std::optional<CommentPage> YouTubeCatalogService::get_comments(const StreamItem&
     return this->fetch_comments_from_watch(item, 24);
 }
 
+bool YouTubeCatalogService::fetch_continuation_page(
+    const std::string& token,
+    const std::string& api_url,
+    const std::vector<HttpHeader>& headers,
+    bool android_client,
+    bool allow_short_videos,
+    size_t limit,
+    std::vector<StreamItem>& out_items,
+    std::string& next_token) const {
+    if (token.empty()) {
+        this->error_message_ = "더 이상 항목이 없습니다";
+        return false;
+    }
+
+    json payload = {
+        {"continuation", token},
+        {"context",
+         {{"client",
+           {{"clientName", android_client ? "ANDROID" : "WEB"},
+            {"clientVersion", android_client ? kAndroidClientVersion : kWebClientVersion},
+            {"hl", android_client ? "en" : "ko"},
+            {"gl", android_client ? "US" : "KR"},
+            {"platform", "DESKTOP"}}}}},
+    };
+
+    const auto response = this->client_->post(api_url, payload.dump(), headers);
+    if (!response.has_value() || response->empty()) {
+        this->error_message_ = "다음 페이지 요청 실패";
+        return false;
+    }
+
+    const json root = json::parse(*response, nullptr, false);
+    if (root.is_discarded()) {
+        this->error_message_ = "다음 페이지 응답 파싱 실패";
+        return false;
+    }
+
+    std::unordered_set<std::string> seen_ids;
+    collect_continuation_items(root, allow_short_videos, limit, seen_ids, out_items);
+    next_token = extract_continuation_token(root);
+    if (out_items.empty() && next_token.empty()) {
+        this->error_message_ = "더 이상 항목이 없습니다";
+        return false;
+    }
+
+    this->error_message_.clear();
+    return true;
+}
+
+std::optional<HomeFeed> YouTubeCatalogService::get_home_feed_more(
+    const std::string& kiosk_id) const {
+    const AppSettings settings = SettingsStore::instance().settings();
+    HomeFeed* cached_feed = nullptr;
+    bool android_client = true;
+    bool allow_short_videos = false;
+    std::vector<HttpHeader> headers;
+
+    for (const auto& preset : kFeedPresets) {
+        if (kiosk_id != preset.id) {
+            continue;
+        }
+        allow_short_videos = preset.allow_short_videos && !settings.hide_short_videos;
+
+        if (kiosk_id == "recommended" && this->auth_store_->has_session()) {
+            const auto it = this->authenticated_browse_cache_.find("FEwhat_to_watch");
+            if (it == this->authenticated_browse_cache_.end()
+                || it->second.continuation_token.empty()) {
+                this->error_message_ = "더 이상 항목이 없습니다";
+                return std::nullopt;
+            }
+
+            std::string auth_error;
+            headers = this->auth_store_->build_youtube_headers(
+                "https://www.youtube.com", "https://www.youtube.com/", &auth_error);
+            if (!auth_error.empty()) {
+                this->error_message_ = auth_error;
+                return std::nullopt;
+            }
+            headers.push_back({"Content-Type", "application/json"});
+            headers.push_back({"User-Agent", kWebUserAgent});
+            headers.push_back({"X-Youtube-Client-Name", "1"});
+            headers.push_back({"X-Youtube-Client-Version", kWebClientVersion});
+            cached_feed = &it->second;
+            android_client = false;
+        } else {
+            const auto it = this->home_feed_cache_.find(kiosk_id);
+            if (it == this->home_feed_cache_.end() || it->second.continuation_token.empty()) {
+                this->error_message_ = "더 이상 항목이 없습니다";
+                return std::nullopt;
+            }
+            headers = {
+                {"Content-Type", "application/json"},
+                {"User-Agent", kAndroidUserAgent},
+                {"X-Youtube-Client-Name", "3"},
+                {"X-Youtube-Client-Version", kAndroidClientVersion},
+                {"Origin", "https://www.youtube.com"},
+            };
+            cached_feed = &it->second;
+            android_client = true;
+        }
+        break;
+    }
+
+    if (!cached_feed) {
+        this->error_message_ = "지원하지 않는 홈 카테고리";
+        return std::nullopt;
+    }
+
+    std::vector<StreamItem> new_items;
+    std::string next_token;
+    const std::string api_url = android_client ? kSearchApiUrl : kBrowseApiUrl;
+    if (!this->fetch_continuation_page(
+            cached_feed->continuation_token,
+            api_url,
+            headers,
+            android_client,
+            allow_short_videos,
+            32,
+            new_items,
+            next_token)) {
+        return std::nullopt;
+    }
+
+    cached_feed->continuation_token = next_token;
+    cached_feed->items.insert(cached_feed->items.end(), new_items.begin(), new_items.end());
+    this->cache_stream_details(new_items);
+    logf("youtube: home more id=%s added=%zu total=%zu",
+         kiosk_id.c_str(),
+         new_items.size(),
+         cached_feed->items.size());
+    return *cached_feed;
+}
+
+std::optional<HomeFeed> YouTubeCatalogService::get_subscriptions_feed_more() const {
+    const AppSettings settings = SettingsStore::instance().settings();
+    const auto it = this->authenticated_browse_cache_.find("FEsubscriptions");
+    if (it == this->authenticated_browse_cache_.end() || it->second.continuation_token.empty()) {
+        this->error_message_ = "더 이상 항목이 없습니다";
+        return std::nullopt;
+    }
+
+    std::string auth_error;
+    auto headers = this->auth_store_->build_youtube_headers(
+        "https://www.youtube.com", "https://www.youtube.com/feed/subscriptions", &auth_error);
+    if (!auth_error.empty()) {
+        this->error_message_ = auth_error;
+        return std::nullopt;
+    }
+    headers.push_back({"Content-Type", "application/json"});
+    headers.push_back({"User-Agent", kWebUserAgent});
+    headers.push_back({"X-Youtube-Client-Name", "1"});
+    headers.push_back({"X-Youtube-Client-Version", kWebClientVersion});
+
+    std::vector<StreamItem> new_items;
+    std::string next_token;
+    if (!this->fetch_continuation_page(
+            it->second.continuation_token,
+            kBrowseApiUrl,
+            headers,
+            false,
+            !settings.hide_short_videos,
+            32,
+            new_items,
+            next_token)) {
+        return std::nullopt;
+    }
+
+    it->second.continuation_token = next_token;
+    it->second.items.insert(it->second.items.end(), new_items.begin(), new_items.end());
+    this->cache_stream_details(new_items);
+    logf("youtube: subscriptions more added=%zu total=%zu",
+         new_items.size(),
+         it->second.items.size());
+    return it->second;
+}
+
+SearchResults YouTubeCatalogService::search_more(const std::string& query) const {
+    SearchResults results;
+    results.query = query;
+
+    const auto token_it = this->search_continuation_cache_.find(query);
+    if (token_it == this->search_continuation_cache_.end() || token_it->second.empty()) {
+        this->error_message_ = "더 이상 검색 결과가 없습니다";
+        return results;
+    }
+
+    const std::vector<HttpHeader> headers = {
+        {"Content-Type", "application/json"},
+        {"User-Agent", kAndroidUserAgent},
+        {"X-Youtube-Client-Name", "3"},
+        {"X-Youtube-Client-Version", kAndroidClientVersion},
+        {"Origin", "https://www.youtube.com"},
+    };
+
+    std::vector<StreamItem> new_items;
+    std::string next_token;
+    const AppSettings settings = SettingsStore::instance().settings();
+    if (!this->fetch_continuation_page(
+            token_it->second,
+            kSearchApiUrl,
+            headers,
+            true,
+            !settings.hide_short_videos,
+            32,
+            new_items,
+            next_token)) {
+        this->search_continuation_cache_.erase(query);
+        return results;
+    }
+
+    results.items = std::move(new_items);
+    results.continuation_token = next_token;
+    this->search_continuation_cache_[query] = next_token;
+    this->cache_stream_details(results.items);
+    logf("youtube: search more query=%s added=%zu",
+         query.c_str(),
+         results.items.size());
+    return results;
+}
+
 SearchResults YouTubeCatalogService::search(const std::string& query) const {
     const AppSettings settings = SettingsStore::instance().settings();
-    return fetch_search_results(query, 20, !settings.hide_short_videos);
+    const SearchResults results = fetch_search_results(query, 20, !settings.hide_short_videos);
+    this->search_continuation_cache_[query] = results.continuation_token;
+    return results;
 }
 
 std::optional<StreamDetail> YouTubeCatalogService::get_stream_detail(const std::string& url) const {

@@ -196,7 +196,7 @@
       "playing": "재생 중",
       "volume": "볼륨"
     },
-    "osd_controls": "A 일시정지  B 뒤로  XY OSD  위아래 볼륨  좌우 10초  LB RB 60초",
+    "osd_controls": "A 일시정지  B 뒤로  X OSD  Y 화질  위아래 볼륨  좌우 10초  LB RB 60초",
     "osd": {
       "auto": "OSD 자동",
       "locked": "OSD 고정",
@@ -207,7 +207,13 @@
       "seek": "이동 {} / {}",
       "seek_unavailable": "이동 불가",
       "seek_live": "라이브는 이동 불가",
-      "seek_buffer_limit": "{} 까지 받음"
+      "seek_buffer_limit": "{} 까지 받음",
+      "quality_unavailable": "화질 선택 불가",
+      "quality_unchanged": "화질 변경 없음",
+      "quality_switch_failed": "화질 전환 실패 {}",
+      "resumed": "{} 부터 이어보기",
+      "docked_high": "도킹 · 1080P",
+      "handheld_720": "휴대 · 720P"
     },
     "loading": {
       "preparing_playback": "재생 준비 중",
@@ -239,7 +245,11 @@
       "requesting_720p_hls_stream": "720P HLS 스트림 요청 중",
       "requesting_720p_avc_stream": "720P AVC 스트림 요청 중",
       "requesting_progressive_stream": "프로그레시브 스트림 요청 중",
-      "requesting_720p_ump_stream": "720P UMP 스트림 요청 중"
+      "requesting_720p_ump_stream": "720P UMP 스트림 요청 중",
+      "switching_quality": "화질 전환 중"
+    },
+    "quality": {
+      "auto": "자동"
     }
   },
   "stream": {

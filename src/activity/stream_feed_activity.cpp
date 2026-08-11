@@ -9,7 +9,7 @@
 #include "view/stream_card.hpp"
 
 namespace {
-constexpr size_t kGridColumns = 4;
+constexpr size_t kGridColumns = 2;
 }
 
 StreamFeedActivity::StreamFeedActivity(std::string title, std::vector<newpipe::StreamItem> items)
