@@ -821,8 +821,18 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve(
     std::string& error_message,
     ResolverStatusCallback on_status) {
     const AppSettings settings = SettingsStore::instance().settings();
-    const int default_height =
-        settings.playback_quality == PlaybackQualityMode::DATA_SAVER ? 480 : 720;
+    int default_height = 720;
+    switch (settings.playback_quality) {
+        case PlaybackQualityMode::DATA_SAVER:
+            default_height = 480;
+            break;
+        case PlaybackQualityMode::QUALITY_FIRST:
+            default_height = 1080;
+            break;
+        default:
+            default_height = 720;
+            break;
+    }
     return resolve_with_height(url, default_height, error_message, std::move(on_status));
 }
 
@@ -853,8 +863,9 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
     const AppSettings settings = SettingsStore::instance().settings();
     const bool prefer_progressive_first =
         settings.playback_quality == PlaybackQualityMode::COMPATIBILITY;
-    const bool allow_adaptive_720 =
-        settings.playback_quality == PlaybackQualityMode::STANDARD_720;
+    const bool allow_adaptive =
+        settings.playback_quality == PlaybackQualityMode::STANDARD_720
+        || settings.playback_quality == PlaybackQualityMode::QUALITY_FIRST;
 
     const auto root = fetch_player_response(
         client_,
@@ -890,14 +901,14 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
         return result;
     }
 
-    if (allow_adaptive_720) {
+    if (allow_adaptive) {
         const auto adaptive_playback =
-            build_adaptive_split_playback(adaptive_formats, *video_id, 720);
-        report_status(on_status, "RESOLVING YOUTUBE STREAM", "REQUESTING 720P HLS STREAM");
+            build_adaptive_split_playback(adaptive_formats, *video_id, preferred_height);
+        report_status(on_status, "RESOLVING YOUTUBE STREAM", "REQUESTING HLS STREAM");
         std::string ios_error;
         std::vector<int> hls_heights;
         if (const auto ios_playback =
-                resolve_ios_hls_playback(client_, *video_id, 720, ios_error, &hls_heights)) {
+                resolve_ios_hls_playback(client_, *video_id, preferred_height, ios_error, &hls_heights)) {
             auto result = *ios_playback;
             merge_heights(available_heights, hls_heights);
             result.available_heights = available_heights;
@@ -929,7 +940,7 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
         std::string ump_error;
         const std::string visitor_data = fetch_web_visitor_data(client_, ump_error);
         if (!visitor_data.empty() && adaptive_playback.has_value()) {
-            report_status(on_status, "RESOLVING YOUTUBE STREAM", "REQUESTING 720P UMP STREAM");
+            report_status(on_status, "RESOLVING YOUTUBE STREAM", "REQUESTING UMP STREAM");
             json vr_client = {
                 {"clientName", "ANDROID_VR"},
                 {"clientVersion", "1.65.10"},
@@ -952,7 +963,7 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
                 auto ump_playback = build_adaptive_split_playback(
                     vr_streaming.value("adaptiveFormats", json::array()),
                     *video_id,
-                    720);
+                    preferred_height);
                 if (ump_playback.has_value()) {
                     enable_ump(*ump_playback);
                     if (progressive_playback.has_value()) {
@@ -966,7 +977,7 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
                     logf("youtube: selected tokenless Android VR UMP video=%s", video_id->c_str());
                     return *ump_playback;
                 }
-                ump_error = "Android VR response did not contain 720p split formats";
+                ump_error = "Android VR response did not contain preferred split formats";
             }
             logf("youtube: tokenless UMP path unavailable video=%s error=%s",
                  video_id->c_str(), ump_error.c_str());
@@ -992,7 +1003,7 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
         }
 
         if (adaptive_playback.has_value()) {
-            report_status(on_status, "RESOLVING YOUTUBE STREAM", "REQUESTING 720P AVC STREAM");
+            report_status(on_status, "RESOLVING YOUTUBE STREAM", "REQUESTING AVC STREAM");
             auto result = *adaptive_playback;
             result.available_heights = available_heights;
             finalize_heights(result.available_heights);
@@ -1008,13 +1019,13 @@ std::optional<ResolvedPlayback> YouTubeResolver::resolve_internal(
     }
 
     const std::string dash_manifest_url = get_string(streaming, "dashManifestUrl");
-    if (allow_adaptive_720
+    if (allow_adaptive
         && !dash_manifest_url.empty()
-        && has_preferred_adaptive_mp4(adaptive_formats, 720)) {
+        && has_preferred_adaptive_mp4(adaptive_formats, preferred_height)) {
         ResolvedPlayback result;
         result.stream_url = dash_manifest_url;
         result.referer = "https://www.youtube.com/watch?v=" + *video_id;
-        result.quality_label = "720p DASH";
+        result.quality_label = "DASH";
         result.available_heights = available_heights;
         finalize_heights(result.available_heights);
         return result;

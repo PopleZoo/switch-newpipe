@@ -11,7 +11,7 @@
 #include "view/tab_focus.hpp"
 
 namespace {
-constexpr size_t kGridColumns = 2;
+constexpr size_t kGridColumns = 3;
 }
 
 SubscriptionsTab::SubscriptionsTab() : service_() {
@@ -26,6 +26,7 @@ void SubscriptionsTab::onCreate() {
     // Mirrored on the sidebar item: while signed out this tab has no focusable
     // child, so a content-only action could never be triggered.
     this->registerTabAction(newpipe::tr("common/refresh"), brls::ControllerButton::BUTTON_X, [this](brls::View*) {
+        this->service_.invalidate_feed_caches();
         this->refresh();
         return true;
     });
@@ -151,6 +152,7 @@ void SubscriptionsTab::buildGrid() {
     }
 
     this->attachLoadMoreTriggers();
+    newpipe::refocus_grid(this, this->gridBox);
 }
 
 void SubscriptionsTab::appendGridRows(size_t start_index) {

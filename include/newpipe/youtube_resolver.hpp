@@ -14,6 +14,7 @@ enum class PlaybackQualityMode {
     STANDARD_720 = 0,
     COMPATIBILITY = 1,
     DATA_SAVER = 2,
+    QUALITY_FIRST = 3,
 };
 
 struct ResolvedPlayback {

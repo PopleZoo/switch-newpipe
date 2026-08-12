@@ -9,6 +9,11 @@
     "info_body": "Switch-NewPipe\nVersion: {}\n\nReal YouTube home, search, subscriptions, related feeds, channel navigation, and on-device playback are connected.\nYou can change playback quality, startup tab, default home category, short-video filtering, and language in Settings.",
     "playback_failed": "Playback failed: {}"
   },
+  "main": {
+    "zr_open_menu": "Open Menu",
+    "tab_menu_title": "Select Tab",
+    "zr_hint": "Press ZR to open menu, Press X to Refresh, Press Y to see details on the selected video."
+  },
   "hints": {
     "ok": "OK",
     "cancel": "Cancel",
@@ -106,7 +111,8 @@
       "options": {
         "standard": "Standard 720p",
         "compatibility": "Compatibility First",
-        "data_saver": "Data Saver"
+        "data_saver": "Data Saver",
+        "quality_first": "Quality First"
       }
     },
     "startup_tab": {

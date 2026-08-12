@@ -37,6 +37,8 @@ int playback_quality_selection(newpipe::PlaybackQualityMode mode) {
             return 1;
         case newpipe::PlaybackQualityMode::DATA_SAVER:
             return 2;
+        case newpipe::PlaybackQualityMode::QUALITY_FIRST:
+            return 3;
         default:
             return 0;
     }
@@ -48,6 +50,8 @@ newpipe::PlaybackQualityMode playback_quality_from_selection(int selection) {
             return newpipe::PlaybackQualityMode::COMPATIBILITY;
         case 2:
             return newpipe::PlaybackQualityMode::DATA_SAVER;
+        case 3:
+            return newpipe::PlaybackQualityMode::QUALITY_FIRST;
         default:
             return newpipe::PlaybackQualityMode::STANDARD_720;
     }
@@ -148,6 +152,7 @@ SettingsTab::SettingsTab() {
             newpipe::tr("settings/playback_quality/options/standard"),
             newpipe::tr("settings/playback_quality/options/compatibility"),
             newpipe::tr("settings/playback_quality/options/data_saver"),
+            newpipe::tr("settings/playback_quality/options/quality_first"),
         },
         0,
         [this](int selection) {

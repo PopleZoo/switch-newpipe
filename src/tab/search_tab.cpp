@@ -131,6 +131,7 @@ void SearchTab::buildGrid() {
     }
 
     attachLoadMoreTriggers();
+    newpipe::refocus_grid(this, gridBox);
 }
 
 void SearchTab::appendGridRows(size_t start_index) {

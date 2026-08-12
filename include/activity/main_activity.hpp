@@ -2,6 +2,7 @@
 
 #include <borealis.hpp>
 
+#include "newpipe/settings_store.hpp"
 #include "view/auto_tab_frame.hpp"
 
 class MainActivity : public brls::Activity {
@@ -11,5 +12,8 @@ public:
     void onContentAvailable() override;
 
 private:
+    void openTabMenu();
+
+    BRLS_BIND(brls::Label, zrHintLabel, "main/zr_hint");
     BRLS_BIND(AutoTabFrame, tabsFrame, "main/tabs");
 };

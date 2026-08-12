@@ -1844,6 +1844,13 @@ bool YouTubeCatalogService::fetch_continuation_page(
 
     std::unordered_set<std::string> seen_ids;
     collect_continuation_items(root, allow_short_videos, limit, seen_ids, out_items);
+    if (out_items.empty()) {
+        // Modern WEB-client continuation responses do not always deliver the
+        // next batch under onResponseReceivedEndpoints; the items can sit in
+        // continuationContents (richItemRenderer / lockupViewModel) instead.
+        // Scanning the whole response picks those up, deduped by seen_ids.
+        collect_stream_items(root, allow_short_videos, limit, seen_ids, out_items);
+    }
     next_token = extract_continuation_token(root);
     if (out_items.empty() && next_token.empty()) {
         this->error_message_ = "더 이상 항목이 없습니다";
@@ -2062,6 +2069,17 @@ void YouTubeCatalogService::cache_stream_detail(const StreamDetail& detail) cons
 
 void YouTubeCatalogService::invalidate_auth_caches() {
     this->authenticated_browse_cache_.clear();
+}
+
+void YouTubeCatalogService::invalidate_feed_caches() const {
+    this->home_feed_cache_.clear();
+    this->related_feed_cache_.clear();
+    this->channel_feed_cache_.clear();
+    this->playlist_feed_cache_.clear();
+    this->authenticated_browse_cache_.clear();
+    this->search_continuation_cache_.clear();
+    this->detail_cache_.clear();
+    this->comments_cache_.clear();
 }
 
 }  // namespace newpipe

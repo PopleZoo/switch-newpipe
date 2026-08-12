@@ -1,5 +1,5 @@
 <brls:Box
-    width="50%"
+    width="33.33%"
     height="auto"
     axis="column"
     paddingLeft="8"
@@ -15,6 +15,7 @@
         id="stream/thumbnail"
         width="100%"
         height="auto"
+        aspectRatio="1.7778"
         scalingType="fill"
         cornerRadius="8"
         backgroundColor="#141517" />

@@ -1,7 +1,7 @@
 <brls:AppletFrame
         iconInterpolation="linear"
         headerHidden="true"
-        footerHidden="false">
+        footerHidden="true">
     <brls:Box
             axis="column"
             width="100%"
@@ -12,8 +12,7 @@
                 tabBackgroundColor="@theme/color/newpipe_bg"
                 tabItemActiveTextColor="@theme/color/newpipe"
                 defaultTab="0"
-                sidebarPosition="left"
-                sidebarWidth="160">
+                demandMode="true">
 
             <Tab
                     label=""
@@ -55,5 +54,18 @@
                 <SettingsTab/>
             </Tab>
         </AutoTabFrame>
+
+        <!-- Bottom overlay hint for ZR menu -->
+        <brls:Label
+            id="main/zr_hint"
+            width="100%"
+            height="40"
+            text="@i18n/main/zr_hint"
+            fontSize="16"
+            textColor="#808080"
+            horizontalAlign="center"
+            verticalAlign="center"
+            marginBottom="8"
+            visibility="visible" />
     </brls:Box>
 </brls:AppletFrame>

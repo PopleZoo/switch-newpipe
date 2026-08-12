@@ -189,6 +189,38 @@ void AutoTabFrame::addTab(AutoSidebarItem* tab, TabViewCreator creator) {
 
 void AutoTabFrame::focusTab(int position) { brls::Application::giveFocus(this->getItem(position)); }
 
+void AutoTabFrame::hideSidebar() {
+    this->sidebar->setVisibility(brls::Visibility::GONE);
+    // Focus can still be parked on a sidebar item (release_grid_focus, showTab
+    // fallback) while it is hidden. View::frameHighlight() draws the focus
+    // border even for GONE views, so suppress the highlight to avoid a stray
+    // border on screen.
+    for (auto* child : this->sidebar->getChildren()) {
+        child->setHideHighlight(true);
+    }
+}
+
+void AutoTabFrame::showTab(int index) {
+    AutoSidebarItem* item = getItem(index);
+    if (!item) return;
+
+    View* newContent = item->getAttachedView();
+    if (!newContent) newContent = item->createAttachedView();
+    if (!newContent) return;
+
+    if (newContent != this->getActiveTab()) {
+        this->group.setActive(item);
+        this->setTabAttachedView(newContent);
+        if (this->tabChangedAction) this->tabChangedAction(item->getCurrentIndex());
+    }
+
+    if (newContent->getDefaultFocus()) {
+        brls::Application::giveFocus(newContent);
+    } else {
+        brls::Application::giveFocus(item);
+    }
+}
+
 void AutoTabFrame::focus2NextTab() {
     size_t sideBarNum = this->sidebar->getChildren().size();
     if (sideBarNum == 0) return;
@@ -345,7 +377,21 @@ void AutoTabFrame::setDefaultTabIndex(size_t index) { this->sidebar->setDefaultF
 
 size_t AutoTabFrame::getDefaultTabIndex() { return this->sidebar->getDefaultFocusedIndex(); }
 
+brls::View* AutoTabFrame::getDefaultFocus() {
+    if (this->sidebar->getVisibility() != brls::Visibility::VISIBLE && this->activeTab) {
+        View* focus = this->activeTab->getDefaultFocus();
+        if (focus) return focus;
+    }
+    return Box::getDefaultFocus();
+}
+
 brls::View* AutoTabFrame::getNextFocus(brls::FocusDirection direction, brls::View* currentView) {
+    // With the sidebar hidden, never navigate sideways into it
+    if (this->sidebar->getVisibility() != brls::Visibility::VISIBLE && currentView != this->sidebar &&
+        direction == brls::FocusDirection::LEFT) {
+        return nullptr;
+    }
+
     // Do not navigate, except through sidebar area
     if (currentView != this->sidebar) {
         if (disableNavigationDown && direction == brls::FocusDirection::DOWN) {

@@ -77,6 +77,8 @@ PlaybackQualityMode sanitize_playback_quality(int value) {
             return PlaybackQualityMode::COMPATIBILITY;
         case static_cast<int>(PlaybackQualityMode::DATA_SAVER):
             return PlaybackQualityMode::DATA_SAVER;
+        case static_cast<int>(PlaybackQualityMode::QUALITY_FIRST):
+            return PlaybackQualityMode::QUALITY_FIRST;
         default:
             return PlaybackQualityMode::STANDARD_720;
     }

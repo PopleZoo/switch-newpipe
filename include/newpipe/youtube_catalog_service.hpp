@@ -43,6 +43,7 @@ public:
     SearchResults search(const std::string& query) const override;
     SearchResults search_more(const std::string& query) const;
     std::optional<StreamDetail> get_stream_detail(const std::string& url) const override;
+    void invalidate_feed_caches() const;
 
 private:
     bool fetch_continuation_page(

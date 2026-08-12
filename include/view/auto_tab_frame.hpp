@@ -223,6 +223,21 @@ public:
 
     AutoTabBarPosition getSideBarPosition();
 
+    /**
+     * Hides the left sidebar: tabs are then switched programmatically with
+     * showTab() instead of through sidebar focus.
+     */
+    void hideSidebar();
+
+    /**
+     * Switches to the tab at the given index and moves focus into its content
+     * (falling back to the still-focusable sidebar item if the content has no
+     * focusable child yet, e.g. while a feed is loading).
+     */
+    void showTab(int index);
+
+    View* getDefaultFocus() override;
+
     int getActiveIndex();
 
     void refresh();

@@ -37,4 +37,45 @@ inline void release_grid_focus(AttachedView* tab, brls::Box* gridBox) {
     }
 }
 
+// Call this after a card grid has been rebuilt.
+//
+// With the sidebar hidden (see AutoTabFrame::hideSidebar), focus may have been
+// parked on an invisible sidebar item by release_grid_focus(). That leaves the
+// user with no visible focus, so once the grid actually has cards again the
+// focus is handed to the first card.
+inline void refocus_grid(AttachedView* tab, brls::Box* gridBox) {
+    if (!tab || !gridBox || gridBox->getChildren().empty()) {
+        return;
+    }
+
+    // The tab bar is only linked by AutoSidebarItem::createAttachedView()
+    // AFTER the attached view's constructor ran. Tabs that build their grid
+    // synchronously in the constructor (LibraryTab::refresh) would otherwise
+    // call getParent() on a null pointer here.
+    brls::View* tabBar = tab->getTabBar();
+    if (!tabBar) {
+        return;
+    }
+    AutoTabFrame* frame = dynamic_cast<AutoTabFrame*>(tabBar->getParent());
+    if (!frame || frame->getSidebar()->getVisibility() == brls::Visibility::VISIBLE) {
+        return;
+    }
+
+    brls::View* focus = brls::Application::getCurrentFocus();
+    if (focus) {
+        bool parked = false;
+        for (brls::View* view = focus; view; view = view->getParent()) {
+            if (view == frame->getSidebar() || view == frame) {
+                parked = true;
+                break;
+            }
+        }
+        if (!parked) {
+            return;
+        }
+    }
+
+    brls::Application::giveFocus(gridBox);
+}
+
 }  // namespace newpipe

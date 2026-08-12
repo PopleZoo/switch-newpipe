@@ -11,7 +11,7 @@
 #include "view/tab_focus.hpp"
 
 namespace {
-constexpr size_t kGridColumns = 2;
+constexpr size_t kGridColumns = 3;
 }
 
 HomeTab::HomeTab() : service_() {
@@ -41,8 +41,9 @@ HomeTab::HomeTab() : service_() {
 void HomeTab::onCreate() {
     // Tab actions are mirrored on the sidebar item so they stay usable while the
     // sidebar holds focus, and when the feed is empty and nothing here is focusable.
-    this->registerTabAction(newpipe::tr("common/refresh"), brls::ControllerButton::BUTTON_X, [this](brls::View*) {
-        loadHome();
+this->registerTabAction(newpipe::tr("common/refresh"), brls::ControllerButton::BUTTON_X, [this](brls::View*) {
+        this->service_.invalidate_feed_caches();
+        this->loadHome();
         return true;
     });
     this->registerTabAction(newpipe::tr("home/category_action"), brls::ControllerButton::BUTTON_Y, [this](brls::View*) {
@@ -161,6 +162,7 @@ void HomeTab::buildGrid() {
     }
 
     attachLoadMoreTriggers();
+    newpipe::refocus_grid(this, gridBox);
 }
 
 void HomeTab::appendGridRows(size_t start_index) {
@@ -205,8 +207,7 @@ void HomeTab::attachLoadMoreTriggers() {
     }
 
     // Focus reaching the last two rows means the user has scrolled near the
-    // bottom, so the next page is fetched then. New rows append below and get
-    // their own triggers, so scrolling can continue indefinitely.
+    // bottom, so the next page is fetched then.
     for (size_t r = children.size() - 2; r < children.size(); r++) {
         auto* row = dynamic_cast<brls::Box*>(children[r]);
         if (!row) {

@@ -82,6 +82,14 @@ The selection interface has been redesigned for easier navigation on the Switch.
 * Better use of available screen space
 * Easier navigation with a controller
 
+### Full-Screen Tab Menu
+
+Press **ZR** to open a full-screen menu with all five tabs (Home, Search, Subscriptions, Library, Settings). The sidebar stays hidden while browsing content, so the menu is the only way to switch tabs.
+
+### Infinite Home Feed
+
+The Home feed loads more recommendation pages as you scroll past the last rows, making the feed effectively infinite. Continuation responses are parsed regardless of their container structure, including the modern WEB-client format.
+
 ---
 
 ## What You Can Do
@@ -95,6 +103,7 @@ The selection interface has been redesigned for easier navigation on the Switch.
 * Log in with cookies to see your subscriptions and personalized recommendations
 * Save watch history and favorites locally
 * Resume videos from their previous playback position
+* Scroll the Home feed infinitely — more recommendations load as you reach the bottom
 * English & Korean UI
 
 ## Controls
@@ -107,6 +116,7 @@ The selection interface has been redesigned for easier navigation on the Switch.
 | `Y`    | Open video details                       |
 | `X`    | Refresh / Reset defaults                 |
 | `RB`   | Manage login session (Subscriptions tab) |
+| `ZR`   | Open the full-screen tab menu            |
 
 ### Player
 

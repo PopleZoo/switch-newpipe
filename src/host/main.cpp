@@ -65,6 +65,36 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    if (more_mode) {
+        std::string error;
+        if (!auth_file.empty()) {
+            if (!service.import_auth_session_from_file(auth_file, &error)) {
+                std::cerr << "auth import failed: " << error << '\n';
+                return 1;
+            }
+        }
+        const auto kiosks = service.list_kiosks();
+        for (const auto& kiosk : kiosks) {
+            const auto feed = service.get_home_feed(kiosk.id);
+            if (!feed.has_value()) {
+                std::cout << "* " << kiosk.id << " FAILED: " << service.error_message() << '\n';
+                continue;
+            }
+            std::cout << "* " << kiosk.id << " initial=" << feed->items.size()
+                      << " hasMore=" << !feed->continuation_token.empty() << '\n';
+            for (int page = 1; page <= 3; page++) {
+                const auto more = service.get_home_feed_more(kiosk.id);
+                if (!more.has_value()) {
+                    std::cout << "  page " << page << " FAILED: " << service.error_message() << '\n';
+                    break;
+                }
+                std::cout << "  page " << page << " total=" << more->items.size()
+                          << " hasMore=" << !more->continuation_token.empty() << '\n';
+            }
+        }
+        return 0;
+    }
+
     if (!search_query.empty()) {
         const auto results = service.search(search_query);
         std::cout << "search: " << results.query << '\n';

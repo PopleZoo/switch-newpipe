@@ -107,6 +107,8 @@ void LibraryTab::buildGrid() {
 
         this->gridBox->addView(row);
     }
+
+    newpipe::refocus_grid(this, this->gridBox);
 }
 
 void LibraryTab::toggleSection() {
